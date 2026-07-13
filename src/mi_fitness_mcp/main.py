@@ -145,9 +145,7 @@ def cmd_sync(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog=PROGRAM_NAME, description="小米运动健康数据 MCP Server"
-    )
+    parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="小米运动健康数据 MCP Server")
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
     subparsers.add_parser("serve", help="运行 MCP Server")
 

@@ -301,7 +301,6 @@ class QueryService:
             return samples[:limit]
         return samples
 
-
     def get_spo2_samples(
         self,
         start_date: str,

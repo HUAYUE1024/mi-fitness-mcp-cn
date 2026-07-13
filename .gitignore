@@ -40,3 +40,4 @@ config.json
 *.sqlite-*
 *.db-*
 *.zip
+.backup/

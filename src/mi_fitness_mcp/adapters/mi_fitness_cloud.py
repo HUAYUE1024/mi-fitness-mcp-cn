@@ -2,7 +2,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
+import random
 import struct
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -27,6 +29,28 @@ from mi_fitness_mcp.models import (
 
 LOGIN_PREFIX = b"&&&START&&&"
 KNOWN_REGIONS = ["ru", "cn", "de", "i2", "sg", "us"]
+AUTH_ERROR_MARKERS = (
+    "authentication failed",
+    "invalid credential",
+    "invalid pass token",
+    "invalid passtoken",
+    "login required",
+    "not logged in",
+    "session expired",
+    "unauthorized",
+)
+logger = logging.getLogger(__name__)
+
+
+class MiFitnessAuthenticationError(RuntimeError):
+    """The Xiaomi cloud session is no longer authenticated."""
+
+
+def _is_authentication_error(code: Any, message: str) -> bool:
+    normalized = message.casefold()
+    return code in {401, 403, -6, -10001} or any(
+        marker in normalized for marker in AUTH_ERROR_MARKERS
+    )
 
 
 def _read_login_payload(text: str) -> dict:
@@ -92,21 +116,52 @@ class MiFitnessCloudAdapter(DataAdapter):
         self._client: httpx.AsyncClient | None = None
         self._connected = False
         self._available_types: list[str] = []
+        self._connect_lock = asyncio.Lock()
+        self.last_error: str | None = None
+        self.last_health_check_at: datetime | None = None
+        self.max_pages = 200
+        self.request_retries = 3
+        self.http_timeout = 20.0
 
     async def connect(self) -> bool:
-        if not self.user_id or not self.pass_token:
-            return False
+        async with self._connect_lock:
+            if not self.user_id or not self.pass_token:
+                self.last_error = "Missing Mi Fitness credentials"
+                self._connected = False
+                return False
+            await self._close_client()
+            self._client = httpx.AsyncClient(timeout=self.http_timeout, follow_redirects=False)
+            try:
+                await self._login_with_token(self.user_id, self.pass_token)
+                # Trust an explicitly configured region. Expensive cross-region discovery
+                # made MCP startup exceed host initialization timeouts.
+                if not self.region:
+                    self.region = await self._discover_region("cn")
+                self._available_types = await self._discover_data_types()
+                self._connected = True
+                self.last_error = None
+                return True
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("Mi Fitness connection failed: %s", self.last_error)
+                self._connected = False
+                await self._close_client()
+                return False
 
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-
+    async def health_check(self) -> bool:
+        self.last_health_check_at = datetime.now(UTC)
+        if not self.is_connected():
+            return await self.connect()
         try:
-            await self._login_with_token(self.user_id, self.pass_token)
-            self.region = await self._discover_region(self.region)
-            self._available_types = await self._discover_data_types()
-            self._connected = True
+            # A one-day query is small and verifies authentication and the data API.
+            today = datetime.now(self._request_timezone()).date().isoformat()
+            await self._fetch_key("steps", today, today)
+            self.last_error = None
             return True
-        except Exception:
-            self._connected = False
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            # Request handling already marks explicit HTTP authentication failures
+            # disconnected. Keep a valid session on transient network/API failures.
             return False
 
     def is_connected(self) -> bool:
@@ -147,7 +202,7 @@ class MiFitnessCloudAdapter(DataAdapter):
             raise RuntimeError("client not initialized")
 
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(self.request_retries):
             try:
                 form = {"data": json.dumps(payload, separators=(",", ":"))}
                 nonce = _gen_nonce()
@@ -175,15 +230,38 @@ class MiFitnessCloudAdapter(DataAdapter):
                 plaintext = _rc4_crypt(signed_nonce, base64.b64decode(response.text))
                 body = json.loads(plaintext)
                 if body.get("code") != 0:
-                    raise RuntimeError(body.get("message", "unknown mi fitness error"))
+                    message = str(body.get("message", "unknown mi fitness error"))
+                    if _is_authentication_error(body.get("code"), message):
+                        raise MiFitnessAuthenticationError(message)
+                    raise RuntimeError(message)
                 return body.get("result", {})
             except Exception as exc:
                 last_error = exc
-                if attempt == 2:
+                retryable = isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                authentication_error = isinstance(exc, MiFitnessAuthenticationError)
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                    authentication_error = status in (401, 403)
+                    if not authentication_error:
+                        retryable = status == 429 or status >= 500
+                if authentication_error:
+                    self._connected = False
+                    if attempt < self.request_retries - 1 and self.user_id and self.pass_token:
+                        try:
+                            await self._login_with_token(self.user_id, self.pass_token)
+                            self._connected = True
+                            retryable = True
+                        except Exception as login_exc:
+                            self.last_error = f"Authentication refresh failed: {login_exc}"
+                            retryable = False
+                    else:
+                        retryable = False
+                if attempt == self.request_retries - 1 or not retryable:
                     break
-                await asyncio.sleep(0.5 * (attempt + 1))
-        raise RuntimeError(f"Mi Fitness request failed: {last_error}")
-
+                await asyncio.sleep(min(4.0, 0.5 * (2**attempt)) + random.random() * 0.1)
+        if isinstance(last_error, MiFitnessAuthenticationError):
+            raise last_error
+        raise RuntimeError(f"Mi Fitness request failed: {last_error}") from last_error
 
     def _request_timezone(self, region: str | None = None) -> timezone:
         region_name = self.region if region is None else region
@@ -212,7 +290,12 @@ class MiFitnessCloudAdapter(DataAdapter):
         next_key = None
         items: list[dict] = []
 
+        seen_keys: set[str] = set()
+        page = 0
         while True:
+            page += 1
+            if page > self.max_pages:
+                raise RuntimeError("Mi Fitness pagination exceeded safety limit")
             payload = {
                 "start_time": start_time,
                 "end_time": end_time,
@@ -225,7 +308,11 @@ class MiFitnessCloudAdapter(DataAdapter):
             items.extend(result.get("data_list", []))
             if not result.get("has_more") or not result.get("next_key"):
                 break
-            next_key = result.get("next_key")
+            candidate = str(result.get("next_key"))
+            if candidate in seen_keys:
+                raise RuntimeError("Mi Fitness pagination cursor loop detected")
+            seen_keys.add(candidate)
+            next_key = candidate
 
         return items
 
@@ -288,7 +375,12 @@ class MiFitnessCloudAdapter(DataAdapter):
         next_key = None
         items: list[dict] = []
 
+        seen_keys: set[str] = set()
+        page = 0
         while True:
+            page += 1
+            if page > self.max_pages:
+                raise RuntimeError("Mi Fitness sport pagination exceeded safety limit")
             payload: dict[str, Any] = {
                 "start_time": start_time,
                 "end_time": end_time,
@@ -303,7 +395,11 @@ class MiFitnessCloudAdapter(DataAdapter):
             items.extend(result.get("sport_records", []))
             if not result.get("has_more") or not result.get("next_key"):
                 break
-            next_key = result.get("next_key")
+            candidate = str(result.get("next_key"))
+            if candidate in seen_keys:
+                raise RuntimeError("Mi Fitness sport pagination cursor loop detected")
+            seen_keys.add(candidate)
+            next_key = candidate
 
         return items
 
@@ -359,7 +455,10 @@ class MiFitnessCloudAdapter(DataAdapter):
             daily[date_str]["distance_m"] += float(payload.get("distance", 0))
             daily[date_str]["active_kcal"] += float(payload.get("calories", 0))
             daily[date_str]["timezone"] = item.get("zone_name") or daily[date_str]["timezone"]
-            if daily[date_str]["collected_at"] is None or collected_at > daily[date_str]["collected_at"]:
+            if (
+                daily[date_str]["collected_at"] is None
+                or collected_at > daily[date_str]["collected_at"]
+            ):
                 daily[date_str]["collected_at"] = collected_at
 
         calorie_records = await self._fetch_key("calories", start_date, end_date)
@@ -370,7 +469,10 @@ class MiFitnessCloudAdapter(DataAdapter):
             date_str = collected_at.strftime("%Y-%m-%d")
             calorie_totals[date_str] += float(payload.get("calories", 0))
             daily[date_str]["timezone"] = item.get("zone_name") or daily[date_str]["timezone"]
-            if daily[date_str]["collected_at"] is None or collected_at > daily[date_str]["collected_at"]:
+            if (
+                daily[date_str]["collected_at"] is None
+                or collected_at > daily[date_str]["collected_at"]
+            ):
                 daily[date_str]["collected_at"] = collected_at
 
         for date_str, total in calorie_totals.items():
@@ -420,13 +522,10 @@ class MiFitnessCloudAdapter(DataAdapter):
             start_at = self._timestamp_to_datetime(sleep_start, zone_offset)
             end_at = self._timestamp_to_datetime(sleep_end, zone_offset)
             duration_minutes = int(
-                payload.get("duration")
-                or max(0, (int(sleep_end) - int(sleep_start)) // 60)
+                payload.get("duration") or max(0, (int(sleep_end) - int(sleep_start)) // 60)
             )
             awake_minutes = int(
-                payload.get("awake_duration")
-                or payload.get("sleep_awake_duration")
-                or 0
+                payload.get("awake_duration") or payload.get("sleep_awake_duration") or 0
             )
             asleep_minutes = max(0, duration_minutes - awake_minutes)
 
@@ -438,7 +537,9 @@ class MiFitnessCloudAdapter(DataAdapter):
                     minutes = max(0, (seg_end - seg_start) // 60)
                     if minutes:
                         stages.append(
-                            SleepStage(stage=self._sleep_stage_name(segment.get("state")), minutes=minutes)
+                            SleepStage(
+                                stage=self._sleep_stage_name(segment.get("state")), minutes=minutes
+                            )
                         )
                 except Exception:
                     continue
@@ -500,12 +601,19 @@ class MiFitnessCloudAdapter(DataAdapter):
                 timezone=item.get("zone_name") or "UTC",
                 collected_at=self._record_datetime(item),
                 workout_id=workout_id,
-                activity_type=str(item.get("category") or item.get("key") or payload.get("sport_type") or "workout"),
+                activity_type=str(
+                    item.get("category")
+                    or item.get("key")
+                    or payload.get("sport_type")
+                    or "workout"
+                ),
                 start_at=start_at,
                 end_at=end_at,
                 duration_minutes=duration_minutes,
                 distance_m=self._optional_float(payload.get("distance")),
-                calories_kcal=self._optional_float(payload.get("calories") or payload.get("total_cal")),
+                calories_kcal=self._optional_float(
+                    payload.get("calories") or payload.get("total_cal")
+                ),
                 avg_heart_rate_bpm=self._optional_int(payload.get("avg_hrm")),
                 max_heart_rate_bpm=self._optional_int(payload.get("max_hrm")),
                 avg_pace_sec_per_km=self._optional_float(payload.get("avg_pace")),
@@ -581,11 +689,12 @@ class MiFitnessCloudAdapter(DataAdapter):
                 user_id=self.user_id or "unknown",
                 timezone=item.get("zone_name") or "UTC",
                 collected_at=self._record_datetime(item),
-                timestamp=self._timestamp_to_datetime(timestamp or item.get("time"), int(item.get("zone_offset", 0) or 0)),
+                timestamp=self._timestamp_to_datetime(
+                    timestamp or item.get("time"), int(item.get("zone_offset", 0) or 0)
+                ),
                 bpm=int(payload.get("bpm", 0)),
                 sample_type="resting",
             )
-
 
     def _stress_level(self, score: int) -> str:
         if score < 30:
@@ -618,7 +727,9 @@ class MiFitnessCloudAdapter(DataAdapter):
                 user_id=self.user_id or "unknown",
                 timezone=item.get("zone_name") or "UTC",
                 collected_at=self._record_datetime(item),
-                timestamp=self._timestamp_to_datetime(timestamp, int(item.get("zone_offset", 0) or 0)),
+                timestamp=self._timestamp_to_datetime(
+                    timestamp, int(item.get("zone_offset", 0) or 0)
+                ),
                 spo2_pct=int(float(spo2)),
             )
 
@@ -647,7 +758,9 @@ class MiFitnessCloudAdapter(DataAdapter):
                 user_id=self.user_id or "unknown",
                 timezone=item.get("zone_name") or "UTC",
                 collected_at=self._record_datetime(item),
-                timestamp=self._timestamp_to_datetime(timestamp, int(item.get("zone_offset", 0) or 0)),
+                timestamp=self._timestamp_to_datetime(
+                    timestamp, int(item.get("zone_offset", 0) or 0)
+                ),
                 stress_score=score,
                 level=self._stress_level(score),
             )

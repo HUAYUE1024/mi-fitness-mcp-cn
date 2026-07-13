@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from mi_fitness_mcp.adapters.base import DataAdapter
@@ -15,7 +15,13 @@ logger = logging.getLogger(__name__)
 class SyncService:
     """Service for synchronizing data from adapters to local database."""
 
-    def __init__(self, adapter: DataAdapter, db: Database):
+    def __init__(
+        self,
+        adapter: DataAdapter,
+        db: Database,
+        default_lookback_days: int = 30,
+        chunk_days: int = 7,
+    ):
         """Initialize sync service.
 
         Args:
@@ -24,6 +30,14 @@ class SyncService:
         """
         self.adapter = adapter
         self.db = db
+        self.default_lookback_days = default_lookback_days
+        self.chunk_days = chunk_days
+        self._sync_lock = asyncio.Lock()
+        self._sync_active = False
+
+    @property
+    def sync_in_progress(self) -> bool:
+        return self._sync_active or self._sync_lock.locked()
 
     async def _iterate_records(self, records: Any) -> AsyncIterator[Any]:
         if hasattr(records, "__aiter__"):
@@ -35,6 +49,26 @@ class SyncService:
             yield record
 
     async def sync_data_type(
+        self,
+        data_type: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        force_full: bool = False,
+    ) -> dict:
+        """Synchronize one type while preventing overlapping sync operations."""
+        # Check and reserve without awaiting, making this atomic for tasks on this loop.
+        if self._sync_active or self._sync_lock.locked():
+            raise RuntimeError("Another synchronization is already in progress")
+        self._sync_active = True
+        try:
+            async with self._sync_lock:
+                return await self._sync_data_type_unlocked(
+                    data_type, start_date, end_date, force_full
+                )
+        finally:
+            self._sync_active = False
+
+    async def _sync_data_type_unlocked(
         self,
         data_type: str,
         start_date: str | None = None,
@@ -64,9 +98,77 @@ class SyncService:
 
         if not end_date:
             end_date = datetime.now().strftime("%Y-%m-%d")
-        if not start_date:
-            start_date = last_record_ts.strftime("%Y-%m-%d") if last_record_ts else "2020-01-01"
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+        except ValueError as exc:
+            raise ValueError("Dates must use YYYY-MM-DD format") from exc
+        if start_dt is None:
+            start_dt = (
+                last_record_ts.replace(tzinfo=None)
+                if last_record_ts
+                else end_dt - timedelta(days=self.default_lookback_days - 1)
+            )
+            start_date = start_dt.strftime("%Y-%m-%d")
+        if start_dt > end_dt:
+            raise ValueError("start_date must not be after end_date")
 
+        chunk_days = getattr(self, "chunk_days", 7)
+        totals = {"added": 0, "updated": 0, "skipped": 0}
+        chunks = []
+        cursor = start_dt
+        while cursor <= end_dt:
+            chunk_end = min(cursor + timedelta(days=chunk_days - 1), end_dt)
+            chunk_start_text = cursor.strftime("%Y-%m-%d")
+            chunk_end_text = chunk_end.strftime("%Y-%m-%d")
+            try:
+                result = await self._sync_range(data_type, chunk_start_text, chunk_end_text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                chunks.append(
+                    {
+                        "start_date": chunk_start_text,
+                        "end_date": chunk_end_text,
+                        "status": "error",
+                        "error_code": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                return {
+                    "status": "partial" if any(c.get("status") == "ok" for c in chunks) else "error",
+                    "data_type": data_type,
+                    **totals,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "chunks": chunks,
+                    "error_code": type(exc).__name__,
+                    "error": str(exc),
+                }
+            for key in totals:
+                totals[key] += result[key]
+            chunks.append(
+                {
+                    "start_date": chunk_start_text,
+                    "end_date": chunk_end_text,
+                    "status": "ok",
+                    "added": result["added"],
+                    "updated": result["updated"],
+                    "skipped": result["skipped"],
+                }
+            )
+            cursor = chunk_end + timedelta(days=1)
+
+        return {
+            "status": "ok",
+            "data_type": data_type,
+            **totals,
+            "start_date": start_date,
+            "end_date": end_date,
+            "chunks": chunks,
+        }
+
+    async def _sync_range(self, data_type: str, start_date: str, end_date: str) -> dict:
         added = 0
         updated = 0
         skipped = 0

@@ -1,9 +1,10 @@
 """MCP server implementation for Mi Fitness."""
 
+import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server import Server
@@ -18,7 +19,6 @@ from mi_fitness_mcp.services.query_service import QueryService
 from mi_fitness_mcp.services.sync_service import SyncService
 from mi_fitness_mcp.storage import Database
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Server("mi-fitness-mcp")
@@ -28,6 +28,20 @@ db = None
 adapter = None
 sync_service = None
 query_service = None
+sync_tasks: dict[str, dict[str, Any]] = {}
+sync_active = False
+MAX_SYNC_TASKS = 100
+
+
+def _prune_sync_tasks() -> None:
+    completed = [
+        sync_id
+        for sync_id, state in sync_tasks.items()
+        if state.get("status") not in {"queued", "running"}
+    ]
+    excess = max(0, len(sync_tasks) - MAX_SYNC_TASKS + 1)
+    for sync_id in completed[:excess]:
+        sync_tasks.pop(sync_id, None)
 
 
 @app.list_tools()
@@ -48,7 +62,17 @@ async def list_tools() -> list[Tool]:
                     "start_date": {"type": "string"},
                     "end_date": {"type": "string"},
                     "force_full_sync": {"type": "boolean"},
+                    "background": {"type": "boolean", "default": False},
                 },
+            },
+        ),
+        Tool(
+            name="get_sync_status",
+            description="Get background synchronization status",
+            inputSchema={
+                "type": "object",
+                "properties": {"sync_id": {"type": "string"}},
+                "required": ["sync_id"],
             },
         ),
         Tool(
@@ -218,6 +242,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = await _handle_get_connection_status()
         elif name == "sync_data":
             result = await _handle_sync_data(arguments)
+        elif name == "get_sync_status":
+            result = _handle_get_sync_status(arguments)
         elif name == "get_profile":
             result = await _handle_get_profile()
         elif name == "get_daily_summary":
@@ -255,7 +281,18 @@ async def _handle_get_connection_status() -> dict:
             mode="not_configured", connected=False, message="Server not configured."
         ).model_dump()
 
-    connected = adapter is not None and adapter.is_connected()
+    connected = False
+    if adapter is not None:
+        if sync_service and sync_service.sync_in_progress:
+            connected = adapter.is_connected()
+        else:
+            try:
+                connected = await asyncio.wait_for(
+                    adapter.health_check(), timeout=config.health_check_timeout_seconds
+                )
+            except Exception as exc:
+                logger.warning("Connection health check failed: %s", exc)
+                connected = False
     last_sync = None
     available_types = []
     if db:
@@ -275,48 +312,164 @@ async def _handle_get_connection_status() -> dict:
                 sync_time = datetime.fromisoformat(state["last_sync_at"])
                 if last_sync is None or sync_time > last_sync:
                     last_sync = sync_time
-    return ConnectionStatus(
+    result = ConnectionStatus(
         mode=config.mode,
         connected=connected,
         last_sync_at=last_sync,
-        available_data_types=available_types,
+        available_data_types=(adapter.get_available_data_types() if connected else available_types),
+        message=getattr(adapter, "last_error", None) if not connected else None,
     ).model_dump()
+    result.update(
+        {
+            "connection_state": "connected" if connected else "disconnected",
+            "region": config.region,
+            "last_health_check_at": getattr(adapter, "last_health_check_at", None),
+            "last_connection_error": getattr(adapter, "last_error", None),
+            "sync_in_progress": bool(sync_service and sync_service.sync_in_progress),
+        }
+    )
+    return result
+
+
+async def _background_sync(sync_id: str, arguments: dict) -> None:
+    global sync_active
+    try:
+        sync_tasks[sync_id].update(
+            status="running", started_at=datetime.now(UTC).isoformat()
+        )
+        sync_tasks[sync_id] = await _run_sync_data(arguments, sync_id)
+    except asyncio.CancelledError:
+        sync_tasks[sync_id] = {"sync_id": sync_id, "status": "cancelled"}
+        raise
+    except Exception as exc:
+        logger.exception("Background synchronization failed")
+        sync_tasks[sync_id] = {
+            "sync_id": sync_id,
+            "status": "error",
+            "error_code": type(exc).__name__,
+            "error": str(exc),
+        }
+    finally:
+        sync_active = False
 
 
 async def _handle_sync_data(arguments: dict) -> dict:
+    global sync_active
+    # No await between check and assignment: foreground/background reservation is atomic.
+    if sync_active:
+        return {"status": "error", "error": "Another synchronization is in progress"}
+    sync_active = True
+
+    if arguments.get("background"):
+        try:
+            _prune_sync_tasks()
+            sync_id = str(uuid.uuid4())
+            sync_tasks[sync_id] = {
+                "sync_id": sync_id,
+                "status": "queued",
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            task = asyncio.create_task(
+                _background_sync(sync_id, {**arguments, "background": False})
+            )
+            sync_tasks[sync_id]["task"] = task
+            return {"status": "accepted", "sync_id": sync_id}
+        except Exception:
+            sync_active = False
+            raise
+
+    try:
+        return await _run_sync_data(arguments)
+    finally:
+        sync_active = False
+
+
+def _handle_get_sync_status(arguments: dict) -> dict:
+    state = sync_tasks.get(arguments.get("sync_id"))
+    if state is None:
+        return {"status": "error", "error": "Unknown sync_id"}
+    return {key: value for key, value in state.items() if key != "task"}
+
+
+async def _run_sync_data(arguments: dict, sync_id: str | None = None) -> dict:
+
     if not sync_service:
         return {"status": "error", "error": "Sync service not initialized"}
-    data_types = arguments.get("data_types") or sync_service.adapter.get_available_data_types()
-    sync_id = str(uuid.uuid4())
-    started_at = datetime.utcnow()
-    total_added = 0
-    total_updated = 0
-    total_skipped = 0
-    types_synced = []
+    if (not adapter or not adapter.is_connected()) and (not adapter or not await adapter.connect()):
+        return {"status": "error", "error": getattr(adapter, "last_error", "Not connected")}
+    data_types_arg = arguments.get("data_types")
+    if data_types_arg == []:
+        return {"status": "error", "error": "data_types must not be empty"}
+    data_types = data_types_arg or sync_service.adapter.get_available_data_types()
+    supported = set(sync_service.adapter.get_available_data_types())
+    unknown = sorted(set(data_types) - supported)
+    if unknown:
+        return {"status": "error", "error": f"Unsupported data types: {', '.join(unknown)}"}
+    sync_id = sync_id or str(uuid.uuid4())
+    started_at = datetime.now(UTC)
+    totals = {"added": 0, "updated": 0, "skipped": 0}
+    details = []
     for data_type in data_types:
+        type_started = datetime.now(UTC)
         try:
-            result = await sync_service.sync_data_type(
-                data_type=data_type,
-                start_date=arguments.get("start_date"),
-                end_date=arguments.get("end_date"),
-                force_full=arguments.get("force_full_sync", False),
+            result = await asyncio.wait_for(
+                sync_service.sync_data_type(
+                    data_type=data_type,
+                    start_date=arguments.get("start_date"),
+                    end_date=arguments.get("end_date"),
+                    force_full=arguments.get("force_full_sync", False),
+                ),
+                timeout=config.sync_type_timeout_seconds,
             )
-            total_added += result.get("added", 0)
-            total_updated += result.get("updated", 0)
-            total_skipped += result.get("skipped", 0)
-            types_synced.append(data_type)
-        except Exception as e:
-            logger.error(f"Failed to sync {data_type}: {e}")
-    finished_at = datetime.utcnow()
+            result_status = result.get("status", "ok")
+            for key in totals:
+                totals[key] += result.get(key, 0)
+            details.append(
+                {
+                    "data_type": data_type,
+                    "status": result_status,
+                    **result,
+                    "duration_seconds": (datetime.now(UTC) - type_started).total_seconds(),
+                }
+            )
+        except TimeoutError:
+            details.append(
+                {
+                    "data_type": data_type,
+                    "status": "error",
+                    "error_code": "timeout",
+                    "error": "Data type synchronization timed out",
+                }
+            )
+        except Exception as exc:
+            logger.exception("Failed to sync %s", data_type)
+            details.append(
+                {
+                    "data_type": data_type,
+                    "status": "error",
+                    "error_code": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+    succeeded = [item["data_type"] for item in details if item["status"] == "ok"]
+    has_partial = any(item["status"] == "partial" for item in details)
+    status = (
+        "ok"
+        if len(succeeded) == len(details)
+        else "partial"
+        if succeeded or has_partial
+        else "error"
+    )
     return {
-        "status": "ok",
+        "status": status,
         "sync_id": sync_id,
         "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "records_added": total_added,
-        "records_updated": total_updated,
-        "records_skipped": total_skipped,
-        "data_types_synced": types_synced,
+        "finished_at": datetime.now(UTC).isoformat(),
+        "records_added": totals["added"],
+        "records_updated": totals["updated"],
+        "records_skipped": totals["skipped"],
+        "data_types_synced": succeeded,
+        "results": details,
     }
 
 
@@ -476,14 +629,29 @@ async def main():
             adapter = MiFitnessCloudAdapter(
                 user_id=user_id, pass_token=pass_token, region=config.region
             )
-            if await adapter.connect():
-                logger.info("Connected to Mi Fitness cloud API")
-            else:
-                logger.warning("Failed to connect to Mi Fitness cloud API")
+            adapter.http_timeout = config.http_timeout_seconds
+            adapter.request_retries = config.request_retries
+            adapter.max_pages = config.max_pages
+            # Do not connect here: MCP stdio must become available even when Xiaomi
+            # authentication or networking is slow. Status/sync tools connect on demand.
     if adapter:
-        sync_service = SyncService(adapter, db)
+        sync_service = SyncService(
+            adapter, db, config.default_lookback_days, config.sync_chunk_days
+        )
         query_service = QueryService(db, adapter.get_user_id() or "unknown")
     else:
         query_service = QueryService(db, "unknown")
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    finally:
+        pending = [
+            state.get("task") for state in sync_tasks.values() if state.get("task") is not None
+        ]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if adapter:
+            await adapter.close()

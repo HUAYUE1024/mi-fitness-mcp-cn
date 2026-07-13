@@ -581,7 +581,6 @@ class Database:
             conn.commit()
             return cursor.rowcount > 0
 
-
     def update_sync_state(self, data_type: str, last_record_ts: datetime | None = None) -> None:
         """Update sync state for a data type."""
         with self._get_connection() as conn:
@@ -856,7 +855,6 @@ class Database:
                         **dict(row),
                     }
                 )
-
 
             for data_type, table_name, date_expr in [
                 ("spo2", "spo2_samples", "timestamp"),
