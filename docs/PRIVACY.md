@@ -39,7 +39,11 @@
 
 扫码登录流程中由**小米动态下发**的跳转地址（`c3.account.xiaomi.com`、`c3.lp.account.xiaomi.com` 等）也全部位于 `*.xiaomi.com` 小米域名下。
 
-**不存在**：遥测(telemetry)、统计(analytics)、Sentry/PostHog/Mixpanel 等上报 SDK、GitHub star 上报、版本检查回传、任何第三方域名。可用以下命令自行复核：
+**不存在**：遥测(telemetry)、统计(analytics)、Sentry/PostHog/Mixpanel 等上报 SDK、GitHub star 上报、版本检查回传、任何第三方域名。
+
+**浏览器端同样零外链**：Web 仪表盘与测试页不引用任何 CDN（无 Google Fonts/图表库外链），字体全部使用系统字体栈——打开页面不会向任何第三方发出请求，离线也能完整渲染。
+
+**最小化出站请求头**：发往小米的请求不携带脚本指纹（覆盖默认 `python-httpx/*` User-Agent 为浏览器 UA，与 Cookie 登录来源一致），请求体只含协议必需字段。可用以下命令自行复核：
 
 ```bash
 grep -rn "https\?://" src/ --include="*.py" | grep -v 127.0.0.1   # 应只见 *.xiaomi.com / *.io.mi.com
