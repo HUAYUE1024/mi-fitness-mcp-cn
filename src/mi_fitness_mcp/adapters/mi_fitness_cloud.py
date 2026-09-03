@@ -130,7 +130,17 @@ class MiFitnessCloudAdapter(DataAdapter):
                 self._connected = False
                 return False
             await self._close_client()
-            self._client = httpx.AsyncClient(timeout=self.http_timeout, follow_redirects=False)
+            self._client = httpx.AsyncClient(
+                timeout=self.http_timeout,
+                follow_redirects=False,
+                # 浏览器 UA 与 Cookie 登录来源一致，避免暴露 python-httpx 指纹
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    )
+                },
+            )
             try:
                 await self._login_with_token(self.user_id, self.pass_token)
                 # Trust an explicitly configured region. Expensive cross-region discovery

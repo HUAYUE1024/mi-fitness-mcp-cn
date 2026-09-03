@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mi-fitness-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "MCP server for Mi Fitness data access"
 readme = "README.md"
 license = {text = "MIT"}

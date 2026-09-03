@@ -184,7 +184,7 @@ async def _gate(x_api_key: str | None = Header(default=None)) -> None:
 
 app = FastAPI(
     title="Mi Fitness API",
-    version="0.2.1",
+    version="0.2.2",
     description="小米运动健康数据 REST API（多 Key 鉴权 + 扫码登录 + 本地 SQLite 缓存）",
     lifespan=lifespan,
     dependencies=[Depends(_gate)],
