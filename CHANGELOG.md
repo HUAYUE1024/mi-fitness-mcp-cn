@@ -23,7 +23,7 @@
 - 扫码登录：逆向小米通用扫码流程（`sid=xiaomiio`），`/api/auth/qr/start|poll` 生成二维码并轮询换取凭据后自动发放 Key，无需浏览器 F12
 - Rust 测试页 `testpage/`（可选，内置 Web 仪表盘的 Rust 替代实现）
 - 修复：`mcp` 依赖加上界 `<2`（MCP SDK 2.x 移除 `Server.list_tools` 导致启动崩溃）
-- 文档：完整技术文档 `docs/PROJECT_DOCUMENTATION.md`（架构/协议/已知问题/重构指南）、扫码登录方案 `docs/QR_LOGIN.md`
+- 文档：隐私与数据安全审计 `docs/PRIVACY.md`
 
 ## 0.1.0
 
