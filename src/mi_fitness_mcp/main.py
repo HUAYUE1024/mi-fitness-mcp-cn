@@ -149,15 +149,24 @@ def cmd_api(args):
 
     import uvicorn
 
-    if args.host not in ("127.0.0.1", "localhost") and not os.environ.get("MI_FITNESS_API_KEY"):
-        print("⚠️  绑定到非本机地址但未设置 MI_FITNESS_API_KEY，健康数据将暴露给局域网。")
-        print("    建议先设置环境变量 MI_FITNESS_API_KEY 再启动。")
-    uvicorn.run("mi_fitness_mcp.api:app", host=args.host, port=args.port)
+    loopback = ("127.0.0.1", "localhost", "::1")
+    if args.host not in loopback:
+        # 非回环绑定：Host 白名单放行该地址（默认仅本机域名，见 security.py）
+        os.environ.setdefault("MI_FITNESS_ALLOWED_HOSTS", args.host)
+        if not os.environ.get("MI_FITNESS_API_KEY"):
+            print("⚠️  绑定到非本机地址但未设置 MI_FITNESS_API_KEY，健康数据将暴露给局域网。")
+            print("    建议先设置环境变量 MI_FITNESS_API_KEY 再启动。")
+    # 关闭访问日志：查询串中的日期等参数不再落入终端/日志
+    uvicorn.run("mi_fitness_mcp.api:app", host=args.host, port=args.port, access_log=False)
 
 
 def cmd_web(args):
+    import os
+
     from mi_fitness_mcp.web import run_server
 
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        os.environ.setdefault("MI_FITNESS_ALLOWED_HOSTS", args.host)
     run_server(
         host=args.host,
         port=args.port,

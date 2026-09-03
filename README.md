@@ -185,6 +185,7 @@ tests/                    # 单元测试与端到端测试套件
 
 ## 文档
 
+- [隐私与数据安全审计](docs/PRIVACY.md) —— 数据流向、全部对外请求清单、威胁模型与自验方法
 - [完整技术文档](docs/PROJECT_DOCUMENTATION.md) —— 架构、小米云协议逆向细节、存储模型、19 条已知问题清单与重构指南
 - [扫码登录实现方案](docs/QR_LOGIN.md) —— 协议时序、端点参数、踩坑记录（`sid=xiaomiio`）
 - [贡献指南](CONTRIBUTING.md) · [安全政策](SECURITY.md) · [更新日志](CHANGELOG.md)
@@ -198,11 +199,14 @@ pytest -v               # 完整测试套件（22 个）
 python -m build         # 构建发行包
 ```
 
-## 安全说明
+## 安全与隐私
+
+**数据只进不出**：本项目从小米云拉取你自己的数据到本地 SQLite，除小米官方服务器外不与任何第三方通信；无遥测/统计/崩溃上报；所有查询端点断网可用。完整审计见 [docs/PRIVACY.md](docs/PRIVACY.md)。
 
 - `passToken` 等同小米账号登录态，**切勿提交或泄露**；若泄露，请在小米账号安全中心退出设备并重新登录
+- 凭据与 API Key 密钥存于系统 keyring（Windows DPAPI / macOS Keychain / Linux Secret Service），不落明文
 - 不要提交本地配置、数据库、keyring 文件（`.gitignore` 已默认排除）
-- 服务默认仅绑定 `127.0.0.1`。向局域网/公网开放前，务必设置 `MI_FITNESS_API_KEY` 与 `MI_FITNESS_ADMIN_KEY`——健康数据是敏感信息
+- 服务默认仅绑定 `127.0.0.1`，并已启用 CORS 本机限制与 Host 白名单（防恶意网页跨站读取 / DNS 重绑定）。向局域网/公网开放前，务必设置 `MI_FITNESS_API_KEY` 与 `MI_FITNESS_ADMIN_KEY`——健康数据是敏感信息
 - 扫码登录端点允许扫码者将其账号登录到你的服务器，务必保持管理鉴权开启
 
 ## 免责声明

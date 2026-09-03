@@ -26,7 +26,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -37,6 +37,14 @@ from pydantic import BaseModel
 from mi_fitness_mcp.adapters.mi_fitness_cloud import MiFitnessCloudAdapter
 from mi_fitness_mcp.auth import load_mi_fitness_token
 from mi_fitness_mcp.config import load_config
+from mi_fitness_mcp.security import (
+    cors_origins_from_env,
+    default_allowed_hosts,
+    delete_api_key_secret,
+    host_allowed,
+    load_api_key_secret,
+    store_api_key_secret,
+)
 from mi_fitness_mcp.services.query_service import QueryService
 from mi_fitness_mcp.services.sync_service import SyncService
 from mi_fitness_mcp.storage import Database
@@ -112,7 +120,20 @@ async def lifespan(app: FastAPI):
             )
             """
         )
+        # 迁移：历史版本把 passToken 明文存在该表，启动时移入系统 keyring 并清空列
+        legacy = conn.execute(
+            "SELECT key, pass_token FROM api_keys WHERE pass_token != ''"
+        ).fetchall()
+        for row in legacy:
+            if store_api_key_secret(row["key"], row["pass_token"]):
+                conn.execute("UPDATE api_keys SET pass_token = '' WHERE key = ?", (row["key"],))
+        # 已吊销 Key 的 keyring 密钥一并清理（历史版本吊销时尚无 keyring 概念）
+        revoked_keys = [
+            r["key"] for r in conn.execute("SELECT key FROM api_keys WHERE revoked = 1").fetchall()
+        ]
         conn.commit()
+        for k in revoked_keys:
+            delete_api_key_secret(k)
 
     default_context = None
     if config.mode == "mi_fitness_cloud":
@@ -163,14 +184,51 @@ async def _gate(x_api_key: str | None = Header(default=None)) -> None:
 
 app = FastAPI(
     title="Mi Fitness API",
-    version="0.2.0",
+    version="0.2.1",
     description="小米运动健康数据 REST API（多 Key 鉴权 + 扫码登录 + 本地 SQLite 缓存）",
     lifespan=lifespan,
     dependencies=[Depends(_gate)],
 )
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    **cors_origins_from_env(default_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"),
 )
+
+
+class HostAllowlistMiddleware:
+    """Host 头白名单（防 DNS 重绑定）：拒绝非本机域名直连本地端口读取数据。"""
+
+    def __init__(self, app, allowed_hosts: set[str] | None = None):
+        self.app = app
+        self.allowed_hosts = allowed_hosts if allowed_hosts is not None else default_allowed_hosts()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            host = ""
+            for name, value in scope.get("headers", []):
+                if name == b"host":
+                    host = value.decode("latin-1")
+                    break
+            if not host_allowed(host, self.allowed_hosts):
+                body = b'{"detail": "Host not allowed"}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 403,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(HostAllowlistMiddleware)
 
 
 def _resolve_context(request: Request) -> UserContext:
@@ -186,7 +244,11 @@ def _resolve_context(request: Request) -> UserContext:
                 (header,),
             ).fetchone()
         if row is not None:
-            cache_key = (row["user_id"], row["pass_token"], row["region"])
+            # passToken 优先从系统 keyring 读取；为空则回退 DB 列（无 keyring 环境的降级存储）
+            pass_token = load_api_key_secret(header) or row["pass_token"]
+            if not pass_token:
+                raise HTTPException(status_code=401, detail="API key credentials unavailable")
+            cache_key = (row["user_id"], pass_token, row["region"])
             ctx = state.contexts.get(cache_key)
             if ctx is None:
                 ctx = _build_context(state.db, state.config, *cache_key)
@@ -249,10 +311,12 @@ class CreateKeyRequest(BaseModel):
 
 def _create_key_record(db: Database, user_id: str, pass_token: str, region: str, label: str | None) -> str:
     key = "mif_sk_" + secrets.token_hex(20)
+    # passToken 存系统 keyring（加密）；keyring 不可用才降级写 DB 明文列
+    stored = store_api_key_secret(key, pass_token)
     with db._get_connection() as conn:
         conn.execute(
             "INSERT INTO api_keys (key, label, user_id, pass_token, region, created_at) VALUES (?,?,?,?,?,?)",
-            (key, label, user_id, pass_token, region, datetime.now(UTC).isoformat()),
+            (key, label, user_id, "" if stored else pass_token, region, datetime.now(UTC).isoformat()),
         )
         conn.commit()
     return key
@@ -322,6 +386,7 @@ async def revoke_key(key_prefix: str, request: Request) -> dict:
             raise HTTPException(status_code=404, detail="没有匹配的 Key（可用完整 Key 或唯一前缀）")
         for k in matches:
             conn.execute("UPDATE api_keys SET revoked = 1 WHERE key = ?", (k,))
+            delete_api_key_secret(k)
         conn.commit()
     return {"status": "ok", "revoked": matches}
 
@@ -760,4 +825,70 @@ def get_coverage(
     request: Request, data_types: Annotated[list[str] | None, Query()] = None
 ) -> dict:
     data = _query_service(request).get_data_coverage(data_types)
+    return {"status": "ok", "count": len(data), "data": data}
+
+
+def _to_csv(rows: list[dict[str, Any]]) -> str:
+    """把查询结果扁平化为 CSV（嵌套结构转 JSON 字符串，加 BOM 便于 Excel 打开中文）。"""
+    import csv
+    import io
+
+    fieldnames: list[str] = []
+    for row in rows:
+        for name in row:
+            if name not in fieldnames:
+                fieldnames.append(name)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
+                for k, v in row.items()
+            }
+        )
+    return "\ufeff" + buf.getvalue()
+
+
+EXPORT_SOURCES = {
+    "daily_activity": lambda qs, s, e: qs.get_daily_summaries(s, e),
+    "heart_rate": lambda qs, s, e: qs.get_heart_rate_samples(s, e),
+    "sleep": lambda qs, s, e: qs.get_sleep_sessions(s, e),
+    "workouts": lambda qs, s, e: qs.get_workouts(s, e),
+    "body_measurements": lambda qs, s, e: qs.get_body_measurements(s, e),
+    "spo2": lambda qs, s, e: qs.get_spo2_samples(s, e),
+    "stress": lambda qs, s, e: qs.get_stress_samples(s, e),
+    "abnormal_heart_beat": lambda qs, s, e: qs.get_abnormal_heart_beat_events(s, e),
+}
+
+
+@app.get("/api/export", response_model=None)
+def export_data(
+    request: Request,
+    data_type: str,
+    start_date: str,
+    end_date: str,
+    format: str = "json",
+) -> Response | dict:
+    """导出本地数据（JSON 或 CSV）。仅读本地 SQLite，不触发任何网络请求。"""
+    if data_type not in EXPORT_SOURCES:
+        raise HTTPException(status_code=400, detail=f"data_type 必须是 {sorted(EXPORT_SOURCES)} 之一")
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="format 必须是 json 或 csv")
+    data = EXPORT_SOURCES[data_type](
+        _query_service(request),
+        _validate_date(start_date, "start_date"),
+        _validate_date(end_date, "end_date"),
+    )
+    if format == "csv":
+        return Response(
+            content=_to_csv(data),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="mi_fitness_{data_type}_{start_date}_{end_date}.csv"'
+                )
+            },
+        )
     return {"status": "ok", "count": len(data), "data": data}

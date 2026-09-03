@@ -22,6 +22,8 @@ from flask import (
     send_from_directory,
 )
 
+from mi_fitness_mcp.security import default_allowed_hosts, host_allowed
+
 # Assets directory: src/mi_fitness_mcp/web_assets or fallback to testpage
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_ASSETS_DIR = PACKAGE_DIR / "web_assets"
@@ -54,6 +56,13 @@ def create_app(
 
     # Persistent HTTP client with 300s timeout (trust_env=False avoids proxy interference on localhost)
     http_client = httpx.Client(trust_env=False, timeout=300.0, follow_redirects=True)
+
+    @app.before_request
+    def _check_host():
+        # Host 头白名单（防 DNS 重绑定）：默认仅本机域名，环境变量可覆盖
+        if not host_allowed(request.host, default_allowed_hosts()):
+            return jsonify({"detail": "Host not allowed"}), 403
+        return None
 
     @app.route("/")
     def index():
