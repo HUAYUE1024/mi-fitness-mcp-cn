@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
+target/
 *.pyc
 *.pyo
 *.pyd

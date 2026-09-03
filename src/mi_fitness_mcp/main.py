@@ -144,6 +144,28 @@ def cmd_sync(args):
     asyncio.run(cmd_sync_async(args))
 
 
+def cmd_api(args):
+    import os
+
+    import uvicorn
+
+    if args.host not in ("127.0.0.1", "localhost") and not os.environ.get("MI_FITNESS_API_KEY"):
+        print("⚠️  绑定到非本机地址但未设置 MI_FITNESS_API_KEY，健康数据将暴露给局域网。")
+        print("    建议先设置环境变量 MI_FITNESS_API_KEY 再启动。")
+    uvicorn.run("mi_fitness_mcp.api:app", host=args.host, port=args.port)
+
+
+def cmd_web(args):
+    from mi_fitness_mcp.web import run_server
+
+    run_server(
+        host=args.host,
+        port=args.port,
+        backend_url=args.backend_url,
+        debug=args.debug,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="小米运动健康数据 MCP Server")
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
@@ -175,6 +197,31 @@ def main():
     sync_parser.add_argument("--start-date", help="开始日期（YYYY-MM-DD）")
     sync_parser.add_argument("--end-date", help="结束日期（YYYY-MM-DD）")
 
+    api_parser = subparsers.add_parser("api", help="启动 HTTP API 服务（供其他程序调用）")
+    api_parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    api_parser.add_argument("--port", type=int, default=8321, help="监听端口（默认 8321）")
+
+    web_parser = subparsers.add_parser("web", help="启动可视化 Web 仪表盘与测试控制台（Flask）")
+    web_parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    web_parser.add_argument("--port", type=int, default=8322, help="监听端口（默认 8322）")
+    web_parser.add_argument(
+        "--backend-url",
+        default="http://127.0.0.1:8321",
+        help="FastAPI 后端服务地址（默认 http://127.0.0.1:8321）",
+    )
+    web_parser.add_argument("--debug", action="store_true", help="开启 Flask 调试模式")
+
+    # Alias for webui
+    webui_parser = subparsers.add_parser("webui", help="启动可视化 Web 仪表盘（web 命令别名）")
+    webui_parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    webui_parser.add_argument("--port", type=int, default=8322, help="监听端口（默认 8322）")
+    webui_parser.add_argument(
+        "--backend-url",
+        default="http://127.0.0.1:8321",
+        help="FastAPI 后端服务地址（默认 http://127.0.0.1:8321）",
+    )
+    webui_parser.add_argument("--debug", action="store_true", help="开启 Flask 调试模式")
+
     args = parser.parse_args()
     if args.command == "serve" or args.command is None:
         asyncio.run(server_main())
@@ -184,6 +231,10 @@ def main():
         cmd_doctor(args)
     elif args.command == "sync":
         cmd_sync(args)
+    elif args.command == "api":
+        cmd_api(args)
+    elif args.command in ("web", "webui"):
+        cmd_web(args)
     else:
         parser.print_help()
         sys.exit(1)

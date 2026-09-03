@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mi Fitness MCP | 健康数据中心与调试控制台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app-container">
+    <!-- Top Header -->
+    <header class="top-header">
+      <div class="header-brand">
+        <div class="brand-icon">⚡</div>
+        <div class="brand-titles">
+          <div class="brand-title">
+            <span>Mi Fitness Hub</span>
+            <span class="brand-badge">MCP CN</span>
+          </div>
+          <div class="brand-subtitle">小米运动健康数据服务 · Python Flask 驱动</div>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <!-- Live Backend Status -->
+        <div class="status-indicator-badge" id="backendStatusBadge" title="FastAPI 后端服务连接状态">
+          <div class="status-dot pulsing" id="backendStatusDot"></div>
+          <span id="backendStatusText">检测连接中...</span>
+        </div>
+
+        <!-- Global Date Range Pickers -->
+        <div class="form-row" style="margin: 0; gap: 6px;">
+          <input type="date" id="startDate" class="input-control" style="width: 130px; padding: 5px 8px; font-size: 12px;" title="开始日期">
+          <span style="color: var(--text-dim);">~</span>
+          <input type="date" id="endDate" class="input-control" style="width: 130px; padding: 5px 8px; font-size: 12px;" title="结束日期">
+        </div>
+
+        <!-- Global API Key Input -->
+        <div class="api-key-input-wrapper" title="X-API-Key（将作为请求头转发）">
+          <input type="password" id="apiKeyInput" placeholder="API Key (留空使用服务端默认)">
+          <button class="api-key-icon-btn" onclick="toggleApiKeyVisibility()" title="显示/隐藏 Key" id="keyVisBtn">👁️</button>
+        </div>
+
+        <!-- Quick Action Buttons -->
+        <button class="btn btn-primary btn-sm" onclick="openQrModal()">📱 扫码登录</button>
+        <button class="btn btn-secondary btn-sm" onclick="switchTab('sync')">🔄 数据同步</button>
+        <button class="btn btn-icon-only btn-sm" id="themeToggleBtn" onclick="toggleTheme()" title="切换浅色/深色主题">🌙</button>
+      </div>
+    </header>
+
+    <!-- Main Layout Grid -->
+    <div class="main-layout">
+      <!-- Left Sidebar Navigation -->
+      <aside class="app-sidebar">
+        <div>
+          <div class="nav-section-title">概览与系统</div>
+          <div class="nav-group">
+            <button class="nav-item active" data-tab="overview">
+              <span class="nav-icon">📊</span>
+              <span>仪表盘总览</span>
+            </button>
+            <button class="nav-item" data-tab="doctor">
+              <span class="nav-icon">🩺</span>
+              <span>连接与诊断</span>
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div class="nav-section-title">健康数据查询</div>
+          <div class="nav-group">
+            <button class="nav-item" data-tab="activity">
+              <span class="nav-icon">👟</span>
+              <span>每日活动</span>
+              <span class="nav-badge">Summary</span>
+            </button>
+            <button class="nav-item" data-tab="heartrate">
+              <span class="nav-icon">❤️</span>
+              <span>心率监测</span>
+              <span class="nav-badge">HR</span>
+            </button>
+            <button class="nav-item" data-tab="sleep">
+              <span class="nav-icon">💤</span>
+              <span>睡眠分析</span>
+              <span class="nav-badge">Sleep</span>
+            </button>
+            <button class="nav-item" data-tab="workouts">
+              <span class="nav-icon">🏃</span>
+              <span>运动记录</span>
+              <span class="nav-badge">Sports</span>
+            </button>
+            <button class="nav-item" data-tab="body">
+              <span class="nav-icon">⚖️</span>
+              <span>体成分与体重</span>
+            </button>
+            <button class="nav-item" data-tab="spo2">
+              <span class="nav-icon">🫁</span>
+              <span>血氧饱和度</span>
+            </button>
+            <button class="nav-item" data-tab="stress">
+              <span class="nav-icon">🧠</span>
+              <span>压力指数</span>
+            </button>
+            <button class="nav-item" data-tab="abnormal">
+              <span class="nav-icon">⚠️</span>
+              <span>异常心跳</span>
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div class="nav-section-title">数据聚合与同步</div>
+          <div class="nav-group">
+            <button class="nav-item" data-tab="series">
+              <span class="nav-icon">📈</span>
+              <span>指标序列分析</span>
+            </button>
+            <button class="nav-item" data-tab="sync">
+              <span class="nav-icon">🔄</span>
+              <span>云端同步中心</span>
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div class="nav-section-title">安全与授权</div>
+          <div class="nav-group">
+            <button class="nav-item" data-tab="keys">
+              <span class="nav-icon">🔑</span>
+              <span>API Key 管理</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center Workspace (Tabbed) -->
+      <main class="app-content">
+        <!-- Date Preset Filter Pills -->
+        <div class="date-preset-pills">
+          <span style="font-size: 11.5px; color: var(--text-dim); margin-right: 4px;">快捷范围:</span>
+          <button class="preset-pill" data-preset="today" id="preset-today">今天</button>
+          <button class="preset-pill active" data-preset="yesterday" id="preset-yesterday">昨天 ~ 今天</button>
+          <button class="preset-pill" data-preset="7d" id="preset-7d">近 7 天</button>
+          <button class="preset-pill" data-preset="30d" id="preset-30d">近 30 天</button>
+          <button class="preset-pill" data-preset="month" id="preset-month">本月</button>
+        </div>
+
+        <!-- 1. Overview Tab -->
+        <section class="tab-pane active" id="tab-overview">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title"><span class="title-icon">📊</span> 健康指标总览</div>
+              <div class="panel-subtitle">基于选定时间范围的最新健康数据概览</div>
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="loadOverview()">🔄 刷新数据</button>
+          </div>
+
+          <div class="stat-cards-grid">
+            <div class="stat-card steps">
+              <div class="stat-card-header">
+                <span class="stat-card-title">今日总步数</span>
+                <div class="stat-card-icon">👟</div>
+              </div>
+              <div class="stat-card-value"><span id="statSteps">--</span> <span class="stat-card-unit">步</span></div>
+              <div class="stat-card-footer">
+                <span>目标 10,000 步</span>
+                <span class="stat-card-badge up">活动</span>
+              </div>
+            </div>
+
+            <div class="stat-card calories">
+              <div class="stat-card-header">
+                <span class="stat-card-title">活动消耗</span>
+                <div class="stat-card-icon">🔥</div>
+              </div>
+              <div class="stat-card-value"><span id="statCalories">--</span> <span class="stat-card-unit">kcal</span></div>
+              <div class="stat-card-footer">
+                <span>距离: <span id="statDistance">--</span> km</span>
+                <span class="stat-card-badge neutral">日常</span>
+              </div>
+            </div>
+
+            <div class="stat-card hr">
+              <div class="stat-card-header">
+                <span class="stat-card-title">静息心率</span>
+                <div class="stat-card-icon">❤️</div>
+              </div>
+              <div class="stat-card-value"><span id="statHr">--</span> <span class="stat-card-unit">bpm</span></div>
+              <div class="stat-card-footer">
+                <span>静息基准</span>
+                <span class="stat-card-badge up">正常</span>
+              </div>
+            </div>
+
+            <div class="stat-card sleep">
+              <div class="stat-card-header">
+                <span class="stat-card-title">最近睡眠</span>
+                <div class="stat-card-icon">💤</div>
+              </div>
+              <div class="stat-card-value"><span id="statSleep">--</span> <span class="stat-card-unit">小时</span></div>
+              <div class="stat-card-footer">
+                <span>包含小睡计算</span>
+                <span class="stat-card-badge neutral">良好</span>
+              </div>
+            </div>
+
+            <div class="stat-card spo2">
+              <div class="stat-card-header">
+                <span class="stat-card-title">血氧饱和度</span>
+                <div class="stat-card-icon">🫁</div>
+              </div>
+              <div class="stat-card-value"><span id="statSpo2">--</span></div>
+              <div class="stat-card-footer">
+                <span>>95% 正常范围</span>
+                <span class="stat-card-badge up">健康</span>
+              </div>
+            </div>
+
+            <div class="stat-card stress">
+              <div class="stat-card-header">
+                <span class="stat-card-title">压力水平</span>
+                <div class="stat-card-icon">🧠</div>
+              </div>
+              <div class="stat-card-value"><span id="statStress">--</span></div>
+              <div class="stat-card-footer">
+                <span>0-100 指数</span>
+                <span class="stat-card-badge neutral">适中</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="glass-panel" style="margin-top: 10px;">
+            <div class="panel-title"><span class="title-icon">⚡</span> 快速操作与数据探测</div>
+            <div style="display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap;">
+              <button class="btn btn-outline" onclick="api('GET', '/api/status?deep=true')">深检服务连接</button>
+              <button class="btn btn-outline" onclick="api('GET', '/api/coverage')">检查数据覆盖率</button>
+              <button class="btn btn-outline" onclick="api('GET', '/')">FastAPI 服务元信息</button>
+              <button class="btn btn-primary" onclick="openQrModal()">📱 启动扫码登录</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. Daily Activity Tab -->
+        <section class="tab-pane" id="tab-activity">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">👟</span> 每日活动汇总 (/api/summary)</div>
+                <div class="panel-subtitle">步数、活动距离、日常活动卡路里消耗</div>
+              </div>
+              <button class="btn btn-primary" onclick="querySummary()">查询活动数据</button>
+            </div>
+            <div id="summaryVisualContainer" style="margin-top: 14px;">
+              <p class="panel-subtitle">点击上方按钮查询所选日期范围内的每日活动汇总...</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. Heart Rate Tab -->
+        <section class="tab-pane" id="tab-heartrate">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">❤️</span> 心率采样 (/api/heart-rate)</div>
+                <div class="panel-subtitle">逐分钟心率采样点、静息心率与极限心率统计</div>
+              </div>
+              <button class="btn btn-primary" onclick="queryHeartRate()">查询心率数据</button>
+            </div>
+
+            <div class="form-row" style="margin-top: 14px;">
+              <div class="form-group">
+                <label class="form-label">心率样本类型 (sample_type)</label>
+                <select id="hrType" class="select-control">
+                  <option value="">全部类型 (All)</option>
+                  <option value="passive">被动日常监测 (passive)</option>
+                  <option value="active">运动活跃采样 (active)</option>
+                  <option value="resting">静息心率 (resting)</option>
+                </select>
+              </div>
+              <div class="form-group sm">
+                <label class="form-label">返回上限 (limit)</label>
+                <input type="number" id="hrLimit" class="input-control" placeholder="默认 100">
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 4. Sleep Tab -->
+        <section class="tab-pane" id="tab-sleep">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">💤</span> 睡眠分析与分段 (/api/sleep)</div>
+                <div class="panel-subtitle">入睡与清醒时间、深睡/浅睡/REM分期、零星小睡统计</div>
+              </div>
+              <button class="btn btn-primary" onclick="querySleep()">查询睡眠分析</button>
+            </div>
+
+            <div class="form-row" style="margin-top: 14px;">
+              <div class="form-group">
+                <label class="form-label">包含小睡 (include_naps)</label>
+                <select id="napsSelect" class="select-control">
+                  <option value="true">包含零星小睡 (True)</option>
+                  <option value="false">仅主睡眠阶段 (False)</option>
+                </select>
+              </div>
+            </div>
+
+            <div id="sleepTimelineWrapper" style="margin-top: 16px;"></div>
+          </div>
+        </section>
+
+        <!-- 5. Workouts Tab -->
+        <section class="tab-pane" id="tab-workouts">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🏃</span> 运动训练记录 (/api/workouts)</div>
+                <div class="panel-subtitle">户外跑步、骑行、徒步等各项运动轨迹、心率区间与配速</div>
+              </div>
+              <button class="btn btn-primary" onclick="queryWorkouts()">查询运动记录</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6. Body Measurements Tab -->
+        <section class="tab-pane" id="tab-body">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">⚖️</span> 体重与体成分 (/api/body-measurements)</div>
+                <div class="panel-subtitle">体脂率、BMI、肌肉量、骨量、内脏脂肪等（需体脂秤支持）</div>
+              </div>
+              <button class="btn btn-primary" onclick="queryBody()">查询体成分数据</button>
+            </div>
+
+            <label class="custom-checkbox">
+              <input type="checkbox" id="latestOnlyCheck">
+              <div class="checkbox-box">✓</div>
+              <span>仅返回最新一条记录 (latest_only=true)</span>
+            </label>
+          </div>
+        </section>
+
+        <!-- 7. SpO2 Tab -->
+        <section class="tab-pane" id="tab-spo2">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🫁</span> 血氧监测 (/api/spo2)</div>
+                <div class="panel-subtitle">全天血氧饱和度连续采样与低血氧告警</div>
+              </div>
+              <button class="btn btn-primary" onclick="querySpo2()">查询血氧记录</button>
+            </div>
+
+            <div class="form-row" style="margin-top: 14px;">
+              <div class="form-group sm">
+                <label class="form-label">数量限制 (limit)</label>
+                <input type="number" id="spo2Limit" class="input-control" placeholder="如 50">
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 8. Stress Tab -->
+        <section class="tab-pane" id="tab-stress">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🧠</span> 压力监测 (/api/stress)</div>
+                <div class="panel-subtitle">全天压力值、压力等级分布与放松建议</div>
+              </div>
+              <button class="btn btn-primary" onclick="queryStress()">查询压力记录</button>
+            </div>
+
+            <div class="form-row" style="margin-top: 14px;">
+              <div class="form-group">
+                <label class="form-label">压力等级过滤 (level)</label>
+                <select id="stressLevel" class="select-control">
+                  <option value="">全部等级 (All)</option>
+                  <option value="low">低度压力 (Low)</option>
+                  <option value="medium">中度压力 (Medium)</option>
+                  <option value="high">高度压力 (High)</option>
+                </select>
+              </div>
+              <div class="form-group sm">
+                <label class="form-label">数量限制 (limit)</label>
+                <input type="number" id="stressLimit" class="input-control" placeholder="如 50">
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 9. Abnormal Heart Beat Tab -->
+        <section class="tab-pane" id="tab-abnormal">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">⚠️</span> 异常心跳事件 (/api/abnormal-heart-beat)</div>
+                <div class="panel-subtitle">静息心率过高、过低或心律不齐事件记录</div>
+              </div>
+              <button class="btn btn-primary" onclick="queryAbnormalHr()">查询异常心跳</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 10. Metric Series Tab -->
+        <section class="tab-pane" id="tab-series">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">📈</span> 指标序列多维分析 (/api/metric-series)</div>
+                <div class="panel-subtitle">按天、周、月聚合分析健康走势</div>
+              </div>
+              <button class="btn btn-primary" onclick="queryMetricSeries()">生成分析序列</button>
+            </div>
+
+            <div class="form-row" style="margin-top: 14px;">
+              <div class="form-group">
+                <label class="form-label">指标类型 (metric)</label>
+                <select id="metricSelect" class="select-control">
+                  <option value="steps">步数 (steps)</option>
+                  <option value="distance_m">距离/米 (distance_m)</option>
+                  <option value="active_kcal">活动卡路里 (active_kcal)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">时间粒度 (granularity)</label>
+                <select id="granularitySelect" class="select-control">
+                  <option value="day">按天聚合 (Day)</option>
+                  <option value="week">按周聚合 (Week)</option>
+                  <option value="month">按月聚合 (Month)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">聚合算法 (aggregation)</label>
+                <select id="aggregationSelect" class="select-control">
+                  <option value="sum">求和 (Sum)</option>
+                  <option value="avg">平均值 (Avg)</option>
+                  <option value="max">最大值 (Max)</option>
+                  <option value="min">最小值 (Min)</option>
+                  <option value="latest">取最新 (Latest)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Visualization Canvas -->
+            <div class="chart-container" id="metricChartContainer" style="margin-top: 16px;">
+              <div class="inspector-empty-state"><p>选择上方指标并点击查询以查看走势图...</p></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 11. Sync Center Tab -->
+        <section class="tab-pane" id="tab-sync">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🔄</span> 云端数据同步控制中心 (/api/sync)</div>
+                <div class="panel-subtitle">从小米运动健康云端拉取最新数据存入本地 SQLite</div>
+              </div>
+            </div>
+
+            <div style="margin-top: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <label class="form-label">选择要同步的数据类型 (多选):</label>
+                <div style="display: flex; gap: 8px;">
+                  <button class="btn btn-outline btn-sm" onclick="selectAllSyncTags(true)">全选</button>
+                  <button class="btn btn-outline btn-sm" onclick="selectAllSyncTags(false)">重置</button>
+                </div>
+              </div>
+
+              <div class="tag-pills-selector" id="syncTagPills"></div>
+            </div>
+
+            <div style="display: flex; gap: 12px; margin-top: 18px; flex-wrap: wrap;">
+              <button class="btn btn-primary" onclick="triggerSync(false)">🚀 前台同步（等待完成）</button>
+              <button class="btn btn-secondary" onclick="triggerSync(true)">⚡ 后台异步同步（立即返回）</button>
+            </div>
+
+            <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border-subtle);">
+              <label class="form-label">后台同步任务进度查询 (/api/sync/{id})</label>
+              <div class="form-row" style="margin-top: 6px;">
+                <div class="form-group">
+                  <input type="text" id="syncIdInput" class="input-control" placeholder="输入后台同步返回的 sync_id (如 sync_abc123)">
+                </div>
+                <button class="btn btn-outline" onclick="pollSyncStatus()">查询任务状态</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 12. API Key Management Tab -->
+        <section class="tab-pane" id="tab-keys">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🔑</span> API Key 密钥管理 (/api/auth/keys)</div>
+                <div class="panel-subtitle">使用小米账号凭据换取独立的 mif_sk_* 密钥，支持多账号与凭据隔离</div>
+              </div>
+              <button class="btn btn-secondary btn-sm" onclick="listKeys()">刷新 Key 列表</button>
+            </div>
+
+            <div class="form-row" style="margin-top: 14px;">
+              <div class="form-group">
+                <label class="form-label">小米 User ID</label>
+                <input type="text" id="keyUserId" class="input-control" placeholder="小米数字 userId">
+              </div>
+              <div class="form-group">
+                <label class="form-label">小米 passToken</label>
+                <input type="password" id="keyPassToken" class="input-control" placeholder="小米登录 passToken">
+              </div>
+              <div class="form-group sm">
+                <label class="form-label">Key 标签</label>
+                <input type="text" id="keyLabel" class="input-control" placeholder="web-ui" value="web-console">
+              </div>
+            </div>
+
+            <button class="btn btn-primary" onclick="createKeyWithCredentials()" style="margin-top: 8px;">用凭据发放 API Key</button>
+
+            <div id="keysTableWrapper" style="margin-top: 20px;"></div>
+          </div>
+        </section>
+
+        <!-- 13. Doctor Tab -->
+        <section class="tab-pane" id="tab-doctor">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🩺</span> 服务连通性与诊断报告</div>
+                <div class="panel-subtitle">测试适配器连通性、区域探测及本地 SQLite 数据库状态</div>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap;">
+              <button class="btn btn-primary" onclick="api('GET', '/api/status?deep=true')">🩺 深度连通性探测 (Deep Check)</button>
+              <button class="btn btn-secondary" onclick="api('GET', '/api/status?deep=false')">⚡ 快速状态自检 (Fast Check)</button>
+              <button class="btn btn-outline" onclick="api('GET', '/api/coverage')">📊 检查本地数据覆盖范围</button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- Right Inspector & Developer Console -->
+      <aside class="app-inspector">
+        <div class="inspector-header">
+          <div class="inspector-title">
+            <span>💻</span> 实时控制台与响应检视
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-secondary btn-sm" onclick="copyResponse()" title="复制 JSON">📋 复制</button>
+            <button class="btn btn-secondary btn-sm" onclick="copyCurl()" title="生成 cURL">cURL</button>
+            <button class="btn btn-secondary btn-sm" onclick="downloadJson()" title="导出 JSON">💾</button>
+          </div>
+        </div>
+
+        <div class="inspector-meta-bar">
+          <div class="meta-badges-group">
+            <span class="http-method-pill get" id="metaMethod">GET</span>
+            <span class="status-pill ok" id="metaStatus">READY</span>
+            <span class="latency-pill" id="metaLatency">-- ms</span>
+          </div>
+          <div style="font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px;" id="metaUrl">/</div>
+        </div>
+
+        <div class="inspector-actions-bar">
+          <input type="text" class="inspector-search-input" placeholder="在响应中过滤搜索..." oninput="filterInspectorJson(this.value)">
+        </div>
+
+        <div class="inspector-body" id="inspectorBody">
+          <div class="inspector-empty-state">
+            <div class="inspector-empty-icon">⚡</div>
+            <div>点击左侧功能发起 API 请求，返回的 JSON 将在此处进行语法高亮显示与检视。</div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- QR Code Login Modal Overlay -->
+  <div class="modal-backdrop" id="qrModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span>📱</span> 小米账号 App / 米家 扫码授权
+        </div>
+        <button class="modal-close-btn" onclick="closeQrModal()">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="qr-container">
+          <div class="qr-image-frame">
+            <img id="qrImage" alt="小米账号登录二维码" src="">
+            <div class="qr-scan-beam" id="qrScanBeam"></div>
+          </div>
+
+          <div style="width: 100%;">
+            <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">
+              <span>二维码状态</span>
+              <span id="qrTimerText">有效期: 5:00</span>
+            </div>
+            <div class="qr-timer-bar">
+              <div class="qr-timer-progress" id="qrProgressBar"></div>
+            </div>
+          </div>
+
+          <div id="qrStatusText" style="text-align: center; font-size: 12.5px; color: var(--text-secondary); line-height: 1.5;">
+            请打开「小米运动健康」或「米家」App 扫码并在手机上点击确认
+          </div>
+
+          <div style="width: 100%; margin-top: 6px;">
+            <label class="form-label">登录 URL 备选通道 (在手机浏览器打开亦可):</label>
+            <div class="form-row" style="margin: 4px 0 0 0;">
+              <input type="text" id="qrLoginUrl" class="input-control" readonly style="font-size: 11px;">
+              <button class="btn btn-secondary btn-sm" onclick="copyLoginUrl()">复制</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="startQrFlow()">🔄 刷新二维码</button>
+        <button class="btn btn-secondary" onclick="closeQrModal()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating Toast Notifications -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Scripts -->
+  <script src="/static/js/app.js"></script>
+  <script>
+    function toggleApiKeyVisibility() {
+      const input = $('apiKeyInput');
+      const btn = $('keyVisBtn');
+      if (input.type === 'password') {
+        input.type = 'text';
+        btn.textContent = '🔒';
+      } else {
+        input.type = 'password';
+        btn.textContent = '👁️';
+      }
+    }
+  </script>
+</body>
+</html>
