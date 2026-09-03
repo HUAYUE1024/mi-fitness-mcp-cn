@@ -1,6 +1,6 @@
 # Mi Fitness MCP CN
 
-[![CI](https://github.com/binglua/mi-fitness-mcp-cn/actions/workflows/ci.yml/badge.svg)](https://github.com/binglua/mi-fitness-mcp-cn/actions/workflows/ci.yml)
+[![CI](https://github.com/HUAYUE1024/mi-fitness-mcp-cn/actions/workflows/ci.yml/badge.svg)](https://github.com/HUAYUE1024/mi-fitness-mcp-cn/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0-orange.svg)](CHANGELOG.md)
@@ -56,7 +56,7 @@ flowchart LR
 ### 安装
 
 ```bash
-git clone https://github.com/binglua/mi-fitness-mcp-cn.git
+git clone https://github.com/HUAYUE1024/mi-fitness-mcp-cn.git
 cd mi-fitness-mcp-cn
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
