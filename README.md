@@ -186,8 +186,6 @@ tests/                    # 单元测试与端到端测试套件
 ## 文档
 
 - [隐私与数据安全审计](docs/PRIVACY.md) —— 数据流向、全部对外请求清单、威胁模型与自验方法
-- [完整技术文档](docs/PROJECT_DOCUMENTATION.md) —— 架构、小米云协议逆向细节、存储模型、19 条已知问题清单与重构指南
-- [扫码登录实现方案](docs/QR_LOGIN.md) —— 协议时序、端点参数、踩坑记录（`sid=xiaomiio`）
 - [贡献指南](CONTRIBUTING.md) · [安全政策](SECURITY.md) · [更新日志](CHANGELOG.md)
 
 ## 本地开发
