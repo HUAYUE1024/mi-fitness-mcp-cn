@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import struct
+import time
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta, timezone
@@ -16,6 +17,7 @@ import httpx
 
 from mi_fitness_mcp.adapters.base import DataAdapter
 from mi_fitness_mcp.models import (
+    DATA_TYPES,
     AbnormalHeartBeatEvent,
     BodyMeasurement,
     DailyActivity,
@@ -88,7 +90,7 @@ def _rc4_crypt(key: bytes, payload: bytes) -> bytes:
 
 def _gen_nonce() -> bytes:
     raw = bytearray(os.urandom(8))
-    raw.extend(struct.pack(">I", int(datetime.now().timestamp() // 60)))
+    raw.extend(struct.pack(">I", int(time.time() // 60)))
     return bytes(raw)
 
 
@@ -273,6 +275,12 @@ class MiFitnessCloudAdapter(DataAdapter):
             raise last_error
         raise RuntimeError(f"Mi Fitness request failed: {last_error}") from last_error
 
+    @staticmethod
+    def _base_url(region_name: str) -> str:
+        if region_name in ("", "cn"):
+            return "https://hlth.io.mi.com"
+        return f"https://{region_name}.hlth.io.mi.com"
+
     def _request_timezone(self, region: str | None = None) -> timezone:
         region_name = self.region if region is None else region
         if region_name in ("", "cn"):
@@ -291,11 +299,7 @@ class MiFitnessCloudAdapter(DataAdapter):
         self, key: str, start_date: str, end_date: str, region: str | None = None
     ) -> list[dict]:
         region_name = region or self.region
-        base_url = (
-            "https://hlth.io.mi.com"
-            if region_name in ("", "cn")
-            else f"https://{region_name}.hlth.io.mi.com"
-        )
+        base_url = self._base_url(region_name)
         start_time, end_time = self._date_range_to_timestamps(start_date, end_date, region_name)
         next_key = None
         items: list[dict] = []
@@ -341,20 +345,9 @@ class MiFitnessCloudAdapter(DataAdapter):
         return preferred_region
 
     async def _discover_data_types(self) -> list[str]:
-        # 小米健康云没有可靠的能力发现接口。旧实现用固定历史区间探测，
-        # 当该区间无数据时会导致自动同步静默跳过大部分指标。
-        # 这里直接返回本适配器支持的全部数据类型；某类型无记录时同步 0 条即可，
-        # 比漏掉近期数据更安全。
-        return [
-            "daily_activity",
-            "heart_rate",
-            "body_measurements",
-            "sleep",
-            "workouts",
-            "spo2",
-            "stress",
-            "abnormal_heart_beat",
-        ]
+        # 小米健康云没有可靠的能力发现接口，直接返回全部类型；某类型无记录时同步 0 条即可，
+        # 比按固定历史区间探测而静默漏掉近期数据更安全。
+        return list(DATA_TYPES)
 
     def _record_datetime(self, item: dict) -> datetime:
         timestamp = int(item.get("time", 0))
@@ -376,11 +369,7 @@ class MiFitnessCloudAdapter(DataAdapter):
         self, start_date: str, end_date: str, region: str | None = None
     ) -> list[dict]:
         region_name = region or self.region
-        base_url = (
-            "https://hlth.io.mi.com"
-            if region_name in ("", "cn")
-            else f"https://{region_name}.hlth.io.mi.com"
-        )
+        base_url = self._base_url(region_name)
         start_time, end_time = self._date_range_to_timestamps(start_date, end_date, region_name)
         next_key = None
         items: list[dict] = []

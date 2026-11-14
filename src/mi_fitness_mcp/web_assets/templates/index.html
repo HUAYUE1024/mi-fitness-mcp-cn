@@ -111,6 +111,10 @@
         <div>
           <div class="nav-section-title">数据聚合与同步</div>
           <div class="nav-group">
+            <button class="nav-item" data-tab="insights">
+              <span class="nav-icon">🧭</span>
+              <span>健康洞察</span>
+            </button>
             <button class="nav-item" data-tab="series">
               <span class="nav-icon">📈</span>
               <span>指标序列分析</span>
@@ -405,6 +409,25 @@
         </section>
 
         <!-- 10. Metric Series Tab -->
+        <section class="tab-pane" id="tab-insights">
+          <div class="glass-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title"><span class="title-icon">🧭</span> 健康洞察</div>
+                <div class="panel-subtitle">区间报告（对比上一期）、历史个人纪录、数据缺口；区间取自顶部日期范围</div>
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-primary" onclick="loadReport()">区间报告</button>
+                <button class="btn btn-outline" onclick="loadRecords()">个人纪录</button>
+                <button class="btn btn-outline" onclick="loadGaps()">数据缺口</button>
+              </div>
+            </div>
+            <div id="insightsWrapper" style="margin-top: 16px;">
+              <div class="inspector-empty-state"><p>选择日期范围后，点击上方按钮生成</p></div>
+            </div>
+          </div>
+        </section>
+
         <section class="tab-pane" id="tab-series">
           <div class="glass-panel">
             <div class="panel-header">
@@ -419,9 +442,28 @@
               <div class="form-group">
                 <label class="form-label">指标类型 (metric)</label>
                 <select id="metricSelect" class="select-control">
-                  <option value="steps">步数 (steps)</option>
-                  <option value="distance_m">距离/米 (distance_m)</option>
-                  <option value="active_kcal">活动卡路里 (active_kcal)</option>
+                  <optgroup label="活动">
+                    <option value="steps">步数 (steps)</option>
+                    <option value="distance_m">距离/米 (distance_m)</option>
+                    <option value="active_kcal">活动卡路里 (active_kcal)</option>
+                  </optgroup>
+                  <optgroup label="睡眠与运动">
+                    <option value="sleep_minutes">睡眠时长/分钟 (sleep_minutes)</option>
+                    <option value="workout_minutes">运动时长/分钟 (workout_minutes)</option>
+                    <option value="workout_kcal">运动消耗 (workout_kcal)</option>
+                  </optgroup>
+                  <optgroup label="心率·血氧·压力">
+                    <option value="resting_heart_rate">静息心率 (resting_heart_rate)</option>
+                    <option value="avg_heart_rate">平均心率 (avg_heart_rate)</option>
+                    <option value="max_heart_rate">最高心率 (max_heart_rate)</option>
+                    <option value="spo2">血氧 (spo2)</option>
+                    <option value="stress">压力 (stress)</option>
+                  </optgroup>
+                  <optgroup label="体成分">
+                    <option value="weight_kg">体重 (weight_kg)</option>
+                    <option value="bmi">BMI (bmi)</option>
+                    <option value="body_fat_pct">体脂率 (body_fat_pct)</option>
+                  </optgroup>
                 </select>
               </div>
               <div class="form-group">
@@ -435,6 +477,7 @@
               <div class="form-group">
                 <label class="form-label">聚合算法 (aggregation)</label>
                 <select id="aggregationSelect" class="select-control">
+                  <option value="">自动（按指标）</option>
                   <option value="sum">求和 (Sum)</option>
                   <option value="avg">平均值 (Avg)</option>
                   <option value="max">最大值 (Max)</option>

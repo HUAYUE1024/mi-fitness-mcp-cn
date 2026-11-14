@@ -37,9 +37,9 @@ def test_storage_and_query_roundtrip(tmp_path):
         bmi=28.0,
     )
 
-    db.insert_daily_activity(activity)
-    db.insert_heart_rate_sample(hr)
-    db.insert_body_measurement(body)
+    db.upsert("daily_activity", [activity])
+    db.upsert("heart_rate", [hr])
+    db.upsert("body_measurements", [body])
 
     query = QueryService(db, "u1")
     assert len(query.get_daily_summaries("2025-04-01", "2025-04-01")) == 1

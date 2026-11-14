@@ -1,19 +1,34 @@
-"""Sync service for importing data from adapters to database."""
+"""Sync service: pulls records from an adapter and upserts them in per-chunk transactions."""
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from mi_fitness_mcp.adapters.base import DataAdapter
 from mi_fitness_mcp.storage import Database
+from mi_fitness_mcp.storage.schema import TABLES
 
 logger = logging.getLogger(__name__)
 
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+ADAPTER_ITERATORS = {
+    "daily_activity": "iter_daily_activity",
+    "sleep": "iter_sleep_sessions",
+    "workouts": "iter_workouts",
+    "body_measurements": "iter_body_measurements",
+    "heart_rate": "iter_heart_rate",
+    "spo2": "iter_spo2",
+    "stress": "iter_stress",
+    "abnormal_heart_beat": "iter_abnormal_heart_beat",
+}
+
 
 class SyncService:
-    """Service for synchronizing data from adapters to local database."""
+    """Synchronizes adapter data into the local database, one date chunk at a time."""
 
     def __init__(
         self,
@@ -22,12 +37,6 @@ class SyncService:
         default_lookback_days: int = 30,
         chunk_days: int = 7,
     ):
-        """Initialize sync service.
-
-        Args:
-            adapter: Data source adapter
-            db: Database instance
-        """
         self.adapter = adapter
         self.db = db
         self.default_lookback_days = default_lookback_days
@@ -39,14 +48,9 @@ class SyncService:
     def sync_in_progress(self) -> bool:
         return self._sync_active or self._sync_lock.locked()
 
-    async def _iterate_records(self, records: Any) -> AsyncIterator[Any]:
-        if hasattr(records, "__aiter__"):
-            async for record in records:
-                yield record
-            return
-
-        for record in records:
-            yield record
+    @property
+    def user_id(self) -> str:
+        return self.adapter.get_user_id() or "unknown"
 
     async def sync_data_type(
         self,
@@ -54,8 +58,9 @@ class SyncService:
         start_date: str | None = None,
         end_date: str | None = None,
         force_full: bool = False,
+        on_progress: ProgressCallback | None = None,
     ) -> dict:
-        """Synchronize one type while preventing overlapping sync operations."""
+        """Synchronize one data type; overlapping syncs are rejected, never queued."""
         # Check and reserve without awaiting, making this atomic for tasks on this loop.
         if self._sync_active or self._sync_lock.locked():
             raise RuntimeError("Another synchronization is already in progress")
@@ -63,80 +68,71 @@ class SyncService:
         try:
             async with self._sync_lock:
                 return await self._sync_data_type_unlocked(
-                    data_type, start_date, end_date, force_full
+                    data_type, start_date, end_date, force_full, on_progress
                 )
         finally:
             self._sync_active = False
 
-    async def _sync_data_type_unlocked(
-        self,
-        data_type: str,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        force_full: bool = False,
-    ) -> dict:
-        """Synchronize a specific data type.
-
-        Args:
-            data_type: Type of data to sync (daily_activity, sleep, workouts, body_measurements)
-            start_date: Start date (YYYY-MM-DD), defaults to 30 days ago
-            end_date: End date (YYYY-MM-DD), defaults to today
-            force_full: Force full sync ignoring last sync state
-
-        Returns:
-            Dict with sync statistics
-        """
-        if not self.adapter.is_connected():
-            raise RuntimeError("Adapter not connected")
-
-        # 获取上次同步状态，用于增量同步
-        last_record_ts = None
-        if not force_full:
-            state = self.db.get_sync_state(data_type)
-            if state and state.get("last_record_timestamp"):
-                last_record_ts = datetime.fromisoformat(state["last_record_timestamp"])
-
-        if not end_date:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+    def _resolve_range(
+        self, data_type: str, start_date: str | None, end_date: str | None, force_full: bool
+    ) -> tuple[datetime, datetime]:
         try:
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date or datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")
             start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
         except ValueError as exc:
             raise ValueError("Dates must use YYYY-MM-DD format") from exc
+
         if start_dt is None:
-            start_dt = (
-                last_record_ts.replace(tzinfo=None)
-                if last_record_ts
-                else end_dt - timedelta(days=self.default_lookback_days - 1)
-            )
-            start_date = start_dt.strftime("%Y-%m-%d")
+            state = None if force_full else self.db.get_sync_state(self.user_id, data_type)
+            cursor = state and state.get("last_record_timestamp")
+            if cursor:
+                # 从游标所在那一天重拉：当天后续还可能有新数据，UPSERT 幂等所以不怕重复。
+                last = datetime.fromisoformat(cursor)
+                start_dt = datetime(last.year, last.month, last.day)
+            else:
+                start_dt = end_dt - timedelta(days=self.default_lookback_days - 1)
+            start_dt = min(start_dt, end_dt)
         if start_dt > end_dt:
             raise ValueError("start_date must not be after end_date")
+        return start_dt, end_dt
 
-        chunk_days = getattr(self, "chunk_days", 7)
+    async def _sync_data_type_unlocked(
+        self,
+        data_type: str,
+        start_date: str | None,
+        end_date: str | None,
+        force_full: bool,
+        on_progress: ProgressCallback | None,
+    ) -> dict:
+        if data_type not in TABLES:
+            raise ValueError(f"Unknown data type: {data_type}")
+        if not self.adapter.is_connected():
+            raise RuntimeError("Adapter not connected")
+
+        start_dt, end_dt = self._resolve_range(data_type, start_date, end_date, force_full)
+        start_date, end_date = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
         totals = {"added": 0, "updated": 0, "skipped": 0}
-        chunks = []
+        chunks: list[dict[str, Any]] = []
         cursor = start_dt
         while cursor <= end_dt:
-            chunk_end = min(cursor + timedelta(days=chunk_days - 1), end_dt)
-            chunk_start_text = cursor.strftime("%Y-%m-%d")
-            chunk_end_text = chunk_end.strftime("%Y-%m-%d")
+            chunk_end = min(cursor + timedelta(days=self.chunk_days - 1), end_dt)
+            chunk = {
+                "start_date": cursor.strftime("%Y-%m-%d"),
+                "end_date": chunk_end.strftime("%Y-%m-%d"),
+            }
             try:
-                result = await self._sync_range(data_type, chunk_start_text, chunk_end_text)
+                result = await self._sync_range(data_type, chunk["start_date"], chunk["end_date"])
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 chunks.append(
-                    {
-                        "start_date": chunk_start_text,
-                        "end_date": chunk_end_text,
-                        "status": "error",
-                        "error_code": type(exc).__name__,
-                        "error": str(exc),
-                    }
+                    {**chunk, "status": "error", "error_code": type(exc).__name__, "error": str(exc)}
                 )
+                if on_progress:
+                    on_progress({"data_type": data_type, **chunks[-1]})
                 return {
-                    "status": "partial" if any(c.get("status") == "ok" for c in chunks) else "error",
+                    "status": "partial" if any(c["status"] == "ok" for c in chunks) else "error",
                     "data_type": data_type,
                     **totals,
                     "start_date": start_date,
@@ -147,16 +143,9 @@ class SyncService:
                 }
             for key in totals:
                 totals[key] += result[key]
-            chunks.append(
-                {
-                    "start_date": chunk_start_text,
-                    "end_date": chunk_end_text,
-                    "status": "ok",
-                    "added": result["added"],
-                    "updated": result["updated"],
-                    "skipped": result["skipped"],
-                }
-            )
+            chunks.append({**chunk, "status": "ok", **{k: result[k] for k in totals}})
+            if on_progress:
+                on_progress({"data_type": data_type, **chunks[-1]})
             cursor = chunk_end + timedelta(days=1)
 
         return {
@@ -169,122 +158,97 @@ class SyncService:
         }
 
     async def _sync_range(self, data_type: str, start_date: str, end_date: str) -> dict:
-        added = 0
-        updated = 0
-        skipped = 0
-        last_ts = None
+        table = TABLES[data_type]
+        iterator = getattr(self.adapter, ADAPTER_ITERATORS[data_type], None)
+        if iterator is None:
+            raise ValueError(f"Adapter does not support {data_type}")
 
-        # 按数据类型执行同步
-        if data_type == "daily_activity":
-            records = self.adapter.iter_daily_activity(start_date, end_date)
-            async for activity in self._iterate_records(records):
-                if self.db.insert_daily_activity(activity):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or (activity.collected_at and activity.collected_at > last_ts):
-                    last_ts = activity.collected_at
-
-        elif data_type == "sleep":
-            records = self.adapter.iter_sleep_sessions(start_date, end_date)
-            async for sleep in self._iterate_records(records):
-                if self.db.insert_sleep_session(sleep):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or sleep.start_at > last_ts:
-                    last_ts = sleep.start_at
-
-        elif data_type == "workouts":
-            records = self.adapter.iter_workouts(start_date, end_date)
-            async for workout in self._iterate_records(records):
-                if self.db.insert_workout(workout):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or workout.start_at > last_ts:
-                    last_ts = workout.start_at
-
-        elif data_type == "body_measurements":
-            records = self.adapter.iter_body_measurements(start_date, end_date)
-            async for measurement in self._iterate_records(records):
-                if self.db.insert_body_measurement(measurement):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or measurement.timestamp > last_ts:
-                    last_ts = measurement.timestamp
-
-        elif data_type == "heart_rate":
-            records = self.adapter.iter_heart_rate(start_date, end_date)
-            async for sample in self._iterate_records(records):
-                if self.db.insert_heart_rate_sample(sample):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or sample.timestamp > last_ts:
-                    last_ts = sample.timestamp
-
-        elif data_type == "spo2":
-            records = self.adapter.iter_spo2(start_date, end_date)
-            async for sample in self._iterate_records(records):
-                if self.db.insert_spo2_sample(sample):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or sample.timestamp > last_ts:
-                    last_ts = sample.timestamp
-
-        elif data_type == "stress":
-            records = self.adapter.iter_stress(start_date, end_date)
-            async for sample in self._iterate_records(records):
-                if self.db.insert_stress_sample(sample):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or sample.timestamp > last_ts:
-                    last_ts = sample.timestamp
-
-        elif data_type == "abnormal_heart_beat":
-            records = self.adapter.iter_abnormal_heart_beat(start_date, end_date)
-            async for event in self._iterate_records(records):
-                if self.db.insert_abnormal_heart_beat_event(event):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or event.start_at > last_ts:
-                    last_ts = event.start_at
-
+        records_iter = iterator(start_date, end_date)
+        if hasattr(records_iter, "__aiter__"):
+            records = [record async for record in records_iter]
         else:
-            raise ValueError(f"Unknown data type: {data_type}")
+            records = list(records_iter)
 
-        # 更新同步状态
-        if last_ts:
-            self.db.update_sync_state(data_type, last_ts)
+        stats = self.db.upsert(data_type, records)
+        times = [t for r in records if (t := getattr(r, table.cursor_attr, None)) is not None]
+        if times:
+            # 一个分块整体入库成功后才推进游标，中途失败不会跳过未入库的数据
+            self.db.update_sync_state(self.user_id, data_type, max(times))
 
-        logger.info(
-            f"Synced {data_type}: {added} added, {updated} updated, "
-            f"range {start_date} to {end_date}"
-        )
+        logger.info("Synced %s %s..%s: %s", data_type, start_date, end_date, stats)
+        return {"data_type": data_type, **stats, "start_date": start_date, "end_date": end_date}
 
-        return {
-            "data_type": data_type,
-            "added": added,
-            "updated": updated,
-            "skipped": skipped,
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-
-    def sync_data_type_sync(
+    async def sync_many(
         self,
-        data_type: str,
+        data_types: list[str] | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
         force_full: bool = False,
+        timeout_seconds: float | None = None,
+        sync_id: str | None = None,
+        on_progress: ProgressCallback | None = None,
     ) -> dict:
-        """Synchronous wrapper for sync_data_type.
+        """依次同步多种数据，单类型失败/超时不影响其它类型，返回统一汇总。"""
+        supported = list(self.adapter.get_available_data_types())
+        data_types = data_types or supported
+        unknown = sorted(set(data_types) - set(supported))
+        if unknown:
+            raise ValueError(f"Unsupported data types: {', '.join(unknown)}")
 
-        Use this when calling from synchronous code.
-        """
-        return asyncio.run(self.sync_data_type(data_type, start_date, end_date, force_full))
+        started_at = datetime.now(UTC)
+        totals = {"added": 0, "updated": 0, "skipped": 0}
+        details: list[dict[str, Any]] = []
+        for data_type in data_types:
+            began = datetime.now(UTC)
+            try:
+                result = await asyncio.wait_for(
+                    self.sync_data_type(
+                        data_type, start_date, end_date, force_full, on_progress=on_progress
+                    ),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                details.append(
+                    {
+                        "data_type": data_type,
+                        "status": "error",
+                        "error_code": "timeout",
+                        "error": "Data type synchronization timed out",
+                    }
+                )
+                continue
+            except Exception as exc:
+                logger.exception("Failed to sync %s", data_type)
+                details.append(
+                    {
+                        "data_type": data_type,
+                        "status": "error",
+                        "error_code": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            for key in totals:
+                totals[key] += result.get(key, 0)
+            details.append(
+                {**result, "duration_seconds": (datetime.now(UTC) - began).total_seconds()}
+            )
+
+        succeeded = [d["data_type"] for d in details if d["status"] == "ok"]
+        if len(succeeded) == len(details):
+            status = "ok"
+        elif succeeded or any(d["status"] == "partial" for d in details):
+            status = "partial"
+        else:
+            status = "error"
+        return {
+            "status": status,
+            "sync_id": sync_id or str(uuid.uuid4()),
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(UTC).isoformat(),
+            "records_added": totals["added"],
+            "records_updated": totals["updated"],
+            "records_skipped": totals["skipped"],
+            "data_types_synced": succeeded,
+            "results": details,
+        }

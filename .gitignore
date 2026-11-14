@@ -42,3 +42,6 @@ config.json
 *.db-*
 *.zip
 .backup/
+
+# Local tooling
+.claude/

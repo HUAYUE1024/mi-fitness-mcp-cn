@@ -1,878 +1,414 @@
-"""SQLite storage layer for Mi Fitness MCP."""
+"""SQLite storage layer. Table shapes live in `schema.py`; this module does the I/O."""
 
-import json
+import contextlib
+import os
 import sqlite3
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from mi_fitness_mcp.models import (
-    AbnormalHeartBeatEvent,
-    BodyMeasurement,
-    DailyActivity,
-    HeartRateSample,
-    SleepSession,
-    SpO2Sample,
-    StressSample,
-    Workout,
-)
+from pydantic import BaseModel
+
+from mi_fitness_mcp.storage.schema import COMMON_COLUMNS, TABLES, Table
+
+UPSERT_CHUNK = 400  # 2 bound params per row for the existence probe stays far below SQLite limits
+LEGACY_TABLE_SUFFIX = "_legacy_v2"
+
+
+def validate_date(value: str, name: str = "date") -> str:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必须为 YYYY-MM-DD 格式，收到 {value!r}") from exc
+    return value
+
+
+def _next_day(value: str) -> str:
+    return (datetime.strptime(value, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 class Database:
-    """SQLite database manager."""
+    """SQLite database manager (WAL mode, one short-lived connection per call)."""
 
     def __init__(self, db_path: Path | str):
-        """Initialize database.
-
-        Args:
-            db_path: Path to SQLite database file
-        """
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _init_db(self) -> None:
-        """Initialize database schema."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with self._get_connection() as conn:
-            # 日常活动表
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS daily_activity (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    date TEXT NOT NULL,
-                    steps INTEGER NOT NULL DEFAULT 0,
-                    distance_m REAL NOT NULL DEFAULT 0,
-                    active_kcal REAL NOT NULL DEFAULT 0,
-                    total_kcal REAL,
-                    floors INTEGER,
-                    active_minutes INTEGER,
-                    UNIQUE(user_id, date, device_id)
-                )
-            """)
-
-            # 睡眠记录表
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sleep_sessions (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    sleep_id TEXT NOT NULL,
-                    start_at TIMESTAMP NOT NULL,
-                    end_at TIMESTAMP NOT NULL,
-                    duration_minutes INTEGER NOT NULL,
-                    time_asleep_minutes INTEGER NOT NULL,
-                    time_awake_minutes INTEGER NOT NULL,
-                    sleep_score INTEGER,
-                    is_nap BOOLEAN DEFAULT FALSE,
-                    stages TEXT,  -- JSON array of sleep stages
-                    UNIQUE(user_id, sleep_id)
-                )
-            """)
-
-            # 运动记录表
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS workouts (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    workout_id TEXT NOT NULL,
-                    activity_type TEXT NOT NULL,
-                    start_at TIMESTAMP NOT NULL,
-                    end_at TIMESTAMP NOT NULL,
-                    duration_minutes INTEGER NOT NULL,
-                    distance_m REAL,
-                    calories_kcal REAL,
-                    avg_heart_rate_bpm INTEGER,
-                    max_heart_rate_bpm INTEGER,
-                    avg_pace_sec_per_km REAL,
-                    max_pace_sec_per_km REAL,
-                    total_steps INTEGER,
-                    UNIQUE(user_id, workout_id)
-                )
-            """)
-
-            # 身体测量表
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS body_measurements (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    timestamp TIMESTAMP NOT NULL,
-                    weight_kg REAL NOT NULL,
-                    bmi REAL,
-                    body_fat_pct REAL,
-                    muscle_mass_kg REAL,
-                    water_pct REAL,
-                    bone_mass_kg REAL,
-                    visceral_fat_score INTEGER,
-                    basal_metabolism_kcal INTEGER,
-                    metabolic_age INTEGER,
-                    UNIQUE(user_id, timestamp, device_id)
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS heart_rate_samples (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    timestamp TIMESTAMP NOT NULL,
-                    bpm INTEGER NOT NULL,
-                    sample_type TEXT NOT NULL,
-                    UNIQUE(user_id, timestamp, sample_type)
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS spo2_samples (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    timestamp TIMESTAMP NOT NULL,
-                    spo2_pct INTEGER NOT NULL,
-                    UNIQUE(user_id, timestamp)
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS stress_samples (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    timestamp TIMESTAMP NOT NULL,
-                    stress_score INTEGER NOT NULL,
-                    level TEXT NOT NULL,
-                    UNIQUE(user_id, timestamp)
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS abnormal_heart_beat_events (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    event_id TEXT NOT NULL,
-                    start_at TIMESTAMP NOT NULL,
-                    end_at TIMESTAMP NOT NULL,
-                    duration_seconds INTEGER NOT NULL,
-                    UNIQUE(user_id, event_id)
-                )
-            """)
-
-            # 同步状态表
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sync_state (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_type TEXT NOT NULL UNIQUE,
-                    last_sync_at TIMESTAMP,
-                    last_record_timestamp TIMESTAMP,
-                    records_count INTEGER DEFAULT 0
-                )
-            """)
-
-            # 创建索引以提升查询性能
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_activity_user_date
-                ON daily_activity(user_id, date)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sleep_user_start
-                ON sleep_sessions(user_id, start_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_workouts_user_start
-                ON workouts(user_id, start_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_measurements_user_ts
-                ON body_measurements(user_id, timestamp)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_heart_rate_user_ts
-                ON heart_rate_samples(user_id, timestamp)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_spo2_user_ts
-                ON spo2_samples(user_id, timestamp)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_stress_user_ts
-                ON stress_samples(user_id, timestamp)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_abnormal_hr_user_start
-                ON abnormal_heart_beat_events(user_id, start_at)
-            """)
-
-            conn.commit()
-
     @contextmanager
-    def _get_connection(self):
-        """Get database connection with row factory."""
-        conn = sqlite3.connect(self.db_path)
+    def _get_connection(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
         finally:
             conn.close()
 
-    def insert_daily_activity(self, activity: DailyActivity) -> bool:
-        """Insert or update daily activity record.
+    # ------------------------------------------------------------------ schema
 
-        Returns:
-            True if record was inserted, False if updated
+    def _init_db(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = not self.db_path.exists()
+        with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            for table in TABLES.values():
+                self._migrate_legacy_table(conn, table)
+                conn.execute(table.ddl())
+                conn.execute(table.index_ddl())
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_cursor (
+                    user_id TEXT NOT NULL,
+                    data_type TEXT NOT NULL,
+                    last_sync_at TIMESTAMP,
+                    last_record_timestamp TIMESTAMP,
+                    PRIMARY KEY (user_id, data_type)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    key TEXT PRIMARY KEY,
+                    label TEXT,
+                    user_id TEXT NOT NULL,
+                    pass_token TEXT NOT NULL,
+                    region TEXT NOT NULL DEFAULT 'cn',
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    revoked INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._migrate_legacy_cursor(conn)
+            conn.commit()
+        if fresh:
+            # 健康数据属于敏感文件：仅当前用户可读写（Windows 上 chmod 基本无效，忽略即可）
+            with contextlib.suppress(OSError):
+                os.chmod(self.db_path, 0o600)
+
+    @staticmethod
+    def _migrate_legacy_table(conn: sqlite3.Connection, table: Table) -> None:
+        """v0.2 之前主键只有 id，多账号会互相覆盖；改为 (user_id, id) 并保留全部数据。"""
+        info = conn.execute(f"PRAGMA table_info({table.name})").fetchall()
+        if not info:
+            return
+        pk_cols = [r["name"] for r in sorted(info, key=lambda r: r["pk"]) if r["pk"]]
+        if pk_cols == ["user_id", "id"]:
+            return
+        legacy = table.name + LEGACY_TABLE_SUFFIX
+        conn.execute(f"DROP TABLE IF EXISTS {legacy}")
+        conn.execute(f"ALTER TABLE {table.name} RENAME TO {legacy}")
+        conn.execute(table.ddl())
+        cols = ", ".join((*table.insert_columns, "created_at", "updated_at"))
+        conn.execute(f"INSERT OR REPLACE INTO {table.name} ({cols}) SELECT {cols} FROM {legacy}")
+        conn.execute(f"DROP TABLE {legacy}")
+
+    @staticmethod
+    def _migrate_legacy_cursor(conn: sqlite3.Connection) -> None:
+        """旧 sync_state 不区分账号：库里只有一个账号的数据时，把游标归给该账号，否则丢弃。"""
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_state'"
+        ).fetchone():
+            return
+        for row in conn.execute("SELECT * FROM sync_state").fetchall():
+            table = TABLES.get(row["data_type"])
+            if table is None:
+                continue
+            users = conn.execute(f"SELECT DISTINCT user_id FROM {table.name} LIMIT 2").fetchall()
+            if len(users) == 1:
+                conn.execute(
+                    "INSERT OR IGNORE INTO sync_cursor VALUES (?, ?, ?, ?)",
+                    (
+                        users[0]["user_id"],
+                        row["data_type"],
+                        row["last_sync_at"],
+                        row["last_record_timestamp"],
+                    ),
+                )
+        conn.execute("DROP TABLE sync_state")
+
+    # ------------------------------------------------------------------ writes
+
+    def upsert(self, data_type: str, records: Iterable[BaseModel]) -> dict[str, int]:
+        """批量幂等写入，一个事务完成。
+
+        返回 {"added": 新增, "updated": 内容有变化的已有记录, "skipped": 完全相同或批内重复}。
         """
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO daily_activity (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, date, steps, distance_m, active_kcal,
-                    total_kcal, floors, active_minutes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    timezone = excluded.timezone,
-                    collected_at = excluded.collected_at,
-                    steps = excluded.steps,
-                    distance_m = excluded.distance_m,
-                    active_kcal = excluded.active_kcal,
-                    total_kcal = excluded.total_kcal,
-                    floors = excluded.floors,
-                    active_minutes = excluded.active_minutes,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    activity.id,
-                    activity.provider,
-                    activity.source_type,
-                    activity.source_record_id,
-                    activity.user_id,
-                    activity.device_id,
-                    activity.timezone,
-                    activity.collected_at.isoformat() if activity.collected_at else None,
-                    activity.date,
-                    activity.steps,
-                    activity.distance_m,
-                    activity.active_kcal,
-                    activity.total_kcal,
-                    activity.floors,
-                    activity.active_minutes,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+        table = TABLES[data_type]
+        unique: dict[tuple[str, str], BaseModel] = {}
+        total = 0
+        for record in records:
+            total += 1
+            unique[(record.user_id, record.id)] = record
+        stats = {"added": 0, "updated": 0, "skipped": total - len(unique)}
+        if not unique:
+            return stats
 
-    def insert_sleep_session(self, sleep: SleepSession) -> bool:
-        """Insert or update sleep session record."""
+        sql = self._upsert_sql(table)
+        batch = list(unique.items())
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO sleep_sessions (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, sleep_id, start_at, end_at, duration_minutes,
-                    time_asleep_minutes, time_awake_minutes, sleep_score, is_nap, stages
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, sleep_id) DO UPDATE SET
-                    duration_minutes = excluded.duration_minutes,
-                    time_asleep_minutes = excluded.time_asleep_minutes,
-                    time_awake_minutes = excluded.time_awake_minutes,
-                    sleep_score = excluded.sleep_score,
-                    stages = excluded.stages,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    sleep.id,
-                    sleep.provider,
-                    sleep.source_type,
-                    sleep.source_record_id,
-                    sleep.user_id,
-                    sleep.device_id,
-                    sleep.timezone,
-                    sleep.collected_at.isoformat() if sleep.collected_at else None,
-                    sleep.sleep_id,
-                    sleep.start_at.isoformat(),
-                    sleep.end_at.isoformat(),
-                    sleep.duration_minutes,
-                    sleep.time_asleep_minutes,
-                    sleep.time_awake_minutes,
-                    sleep.sleep_score,
-                    sleep.is_nap,
-                    json.dumps([s.model_dump() for s in sleep.stages]),
-                ),
-            )
+            for i in range(0, len(batch), UPSERT_CHUNK):
+                chunk = batch[i : i + UPSERT_CHUNK]
+                probe = ",".join(["(?,?)"] * len(chunk))
+                existing = conn.execute(
+                    f"SELECT COUNT(*) FROM {table.name} WHERE (user_id, id) IN (VALUES {probe})",
+                    [part for key, _ in chunk for part in key],
+                ).fetchone()[0]
+                before = conn.total_changes
+                conn.executemany(sql, [table.encode(rec) for _, rec in chunk])
+                changed = conn.total_changes - before
+                added = len(chunk) - existing
+                updated = max(0, changed - added)
+                stats["added"] += added
+                stats["updated"] += updated
+                stats["skipped"] += existing - updated
             conn.commit()
-            return cursor.rowcount > 0
+        return stats
 
-    def insert_workout(self, workout: Workout) -> bool:
-        """Insert or update workout record."""
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO workouts (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, workout_id, activity_type, start_at, end_at,
-                    duration_minutes, distance_m, calories_kcal, avg_heart_rate_bpm,
-                    max_heart_rate_bpm, avg_pace_sec_per_km, max_pace_sec_per_km, total_steps
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, workout_id) DO UPDATE SET
-                    duration_minutes = excluded.duration_minutes,
-                    distance_m = excluded.distance_m,
-                    calories_kcal = excluded.calories_kcal,
-                    avg_heart_rate_bpm = excluded.avg_heart_rate_bpm,
-                    max_heart_rate_bpm = excluded.max_heart_rate_bpm,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    workout.id,
-                    workout.provider,
-                    workout.source_type,
-                    workout.source_record_id,
-                    workout.user_id,
-                    workout.device_id,
-                    workout.timezone,
-                    workout.collected_at.isoformat() if workout.collected_at else None,
-                    workout.workout_id,
-                    workout.activity_type,
-                    workout.start_at.isoformat(),
-                    workout.end_at.isoformat(),
-                    workout.duration_minutes,
-                    workout.distance_m,
-                    workout.calories_kcal,
-                    workout.avg_heart_rate_bpm,
-                    workout.max_heart_rate_bpm,
-                    workout.avg_pace_sec_per_km,
-                    workout.max_pace_sec_per_km,
-                    workout.total_steps,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+    @staticmethod
+    def _upsert_sql(table: Table) -> str:
+        cols = table.insert_columns
+        mutable = [c for c in cols if c not in ("id", "user_id")]
+        return (
+            f"INSERT INTO {table.name} ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' * len(cols))}) "
+            f"ON CONFLICT(user_id, id) DO UPDATE SET "
+            f"{', '.join(f'{c} = excluded.{c}' for c in mutable)}, updated_at = CURRENT_TIMESTAMP "
+            f"WHERE ({', '.join(mutable)}) IS NOT ({', '.join(f'excluded.{c}' for c in mutable)})"
+        )
 
-    def insert_body_measurement(self, measurement: BodyMeasurement) -> bool:
-        """Insert or update body measurement record."""
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO body_measurements (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, timestamp, weight_kg, bmi, body_fat_pct,
-                    muscle_mass_kg, water_pct, bone_mass_kg, visceral_fat_score,
-                    basal_metabolism_kcal, metabolic_age
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    weight_kg = excluded.weight_kg,
-                    bmi = excluded.bmi,
-                    body_fat_pct = excluded.body_fat_pct,
-                    muscle_mass_kg = excluded.muscle_mass_kg,
-                    water_pct = excluded.water_pct,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    measurement.id,
-                    measurement.provider,
-                    measurement.source_type,
-                    measurement.source_record_id,
-                    measurement.user_id,
-                    measurement.device_id,
-                    measurement.timezone,
-                    measurement.collected_at.isoformat() if measurement.collected_at else None,
-                    measurement.timestamp.isoformat(),
-                    measurement.weight_kg,
-                    measurement.bmi,
-                    measurement.body_fat_pct,
-                    measurement.muscle_mass_kg,
-                    measurement.water_pct,
-                    measurement.bone_mass_kg,
-                    measurement.visceral_fat_score,
-                    measurement.basal_metabolism_kcal,
-                    measurement.metabolic_age,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def insert_heart_rate_sample(self, sample: HeartRateSample) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO heart_rate_samples (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, timestamp, bpm, sample_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    timezone = excluded.timezone,
-                    collected_at = excluded.collected_at,
-                    timestamp = excluded.timestamp,
-                    bpm = excluded.bpm,
-                    sample_type = excluded.sample_type,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    sample.id,
-                    sample.provider,
-                    sample.source_type,
-                    sample.source_record_id,
-                    sample.user_id,
-                    sample.device_id,
-                    sample.timezone,
-                    sample.collected_at.isoformat() if sample.collected_at else None,
-                    sample.timestamp.isoformat(),
-                    sample.bpm,
-                    sample.sample_type,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def insert_spo2_sample(self, sample: SpO2Sample) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO spo2_samples (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, timestamp, spo2_pct
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    timezone = excluded.timezone,
-                    collected_at = excluded.collected_at,
-                    timestamp = excluded.timestamp,
-                    spo2_pct = excluded.spo2_pct,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    sample.id,
-                    sample.provider,
-                    sample.source_type,
-                    sample.source_record_id,
-                    sample.user_id,
-                    sample.device_id,
-                    sample.timezone,
-                    sample.collected_at.isoformat() if sample.collected_at else None,
-                    sample.timestamp.isoformat(),
-                    sample.spo2_pct,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def insert_stress_sample(self, sample: StressSample) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO stress_samples (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, timestamp, stress_score, level
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    timezone = excluded.timezone,
-                    collected_at = excluded.collected_at,
-                    timestamp = excluded.timestamp,
-                    stress_score = excluded.stress_score,
-                    level = excluded.level,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    sample.id,
-                    sample.provider,
-                    sample.source_type,
-                    sample.source_record_id,
-                    sample.user_id,
-                    sample.device_id,
-                    sample.timezone,
-                    sample.collected_at.isoformat() if sample.collected_at else None,
-                    sample.timestamp.isoformat(),
-                    sample.stress_score,
-                    sample.level,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def insert_abnormal_heart_beat_event(self, event: AbnormalHeartBeatEvent) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO abnormal_heart_beat_events (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, event_id, start_at, end_at, duration_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, event_id) DO UPDATE SET
-                    timezone = excluded.timezone,
-                    collected_at = excluded.collected_at,
-                    start_at = excluded.start_at,
-                    end_at = excluded.end_at,
-                    duration_seconds = excluded.duration_seconds,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    event.id,
-                    event.provider,
-                    event.source_type,
-                    event.source_record_id,
-                    event.user_id,
-                    event.device_id,
-                    event.timezone,
-                    event.collected_at.isoformat() if event.collected_at else None,
-                    event.event_id,
-                    event.start_at.isoformat(),
-                    event.end_at.isoformat(),
-                    event.duration_seconds,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def update_sync_state(self, data_type: str, last_record_ts: datetime | None = None) -> None:
-        """Update sync state for a data type."""
+    def update_sync_state(
+        self, user_id: str, data_type: str, last_record_ts: datetime | str | None = None
+    ) -> None:
+        """记录同步时间；游标只前进不后退（补拉历史区间不会把增量起点拉回去）。"""
+        ts = (
+            last_record_ts.isoformat() if isinstance(last_record_ts, datetime) else last_record_ts
+        )
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO sync_state (data_type, last_sync_at, last_record_timestamp)
-                VALUES (?, CURRENT_TIMESTAMP, ?)
-                ON CONFLICT(data_type) DO UPDATE SET
+                INSERT INTO sync_cursor (user_id, data_type, last_sync_at, last_record_timestamp)
+                VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(user_id, data_type) DO UPDATE SET
                     last_sync_at = CURRENT_TIMESTAMP,
-                    last_record_timestamp = excluded.last_record_timestamp
+                    last_record_timestamp = MAX(
+                        COALESCE(last_record_timestamp, ''), COALESCE(excluded.last_record_timestamp, '')
+                    )
                 """,
-                (data_type, last_record_ts.isoformat() if last_record_ts else None),
+                (user_id, data_type, ts),
             )
             conn.commit()
 
-    def get_sync_state(self, data_type: str) -> dict[str, Any] | None:
-        """Get sync state for a data type."""
+    # ------------------------------------------------------------------- reads
+
+    def get_sync_state(self, user_id: str, data_type: str) -> dict[str, Any] | None:
         with self._get_connection() as conn:
             row = conn.execute(
-                "SELECT * FROM sync_state WHERE data_type = ?",
-                (data_type,),
+                "SELECT * FROM sync_cursor WHERE user_id = ? AND data_type = ?",
+                (user_id, data_type),
             ).fetchone()
-            return dict(row) if row else None
+        if row is None:
+            return None
+        state = dict(row)
+        state["last_record_timestamp"] = state["last_record_timestamp"] or None
+        return state
 
-    def query_daily_activity(
-        self,
+    @staticmethod
+    def _range_filter(
+        table: Table,
         user_id: str,
         start_date: str,
         end_date: str,
-    ) -> list[dict[str, Any]]:
-        """Query daily activity records."""
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM daily_activity
-                WHERE user_id = ? AND date >= ? AND date <= ?
-                ORDER BY date
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
+        where: dict[str, Any] | None,
+    ) -> tuple[str, list[Any]]:
+        """日期闭区间 + 等值过滤的 WHERE 子句。列名只接受表内已知字段，值一律参数化。"""
+        validate_date(start_date, "start_date")
+        validate_date(end_date, "end_date")
+        clauses = ["user_id = ?", f"{table.time_col} >= ?", f"{table.time_col} < ?"]
+        params: list[Any] = [user_id, start_date, _next_day(end_date)]
+        for key, value in (where or {}).items():
+            if key not in table.field_names:
+                raise ValueError(f"{table.data_type} 没有可过滤的字段 {key!r}")
+            clauses.append(f"{key} = ?")
+            params.append(value)
+        return " AND ".join(clauses), params
 
-    def query_sleep_sessions(
+    def query(
         self,
+        data_type: str,
         user_id: str,
         start_date: str,
         end_date: str,
+        *,
+        where: dict[str, Any] | None = None,
+        limit: int | None = None,
+        descending: bool = False,
     ) -> list[dict[str, Any]]:
-        """Query sleep session records."""
+        """按日期闭区间读取。时间列保存本地时区 ISO 串，字符串区间比较即可走 (user_id, 时间) 索引。"""
+        table = TABLES[data_type]
+        where_sql, params = self._range_filter(table, user_id, start_date, end_date, where)
+        sql = (
+            f"SELECT * FROM {table.name} WHERE {where_sql} "
+            f"ORDER BY {table.time_col} {'DESC' if descending else 'ASC'}"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
         with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM sleep_sessions
-                WHERE user_id = ?
-                AND substr(start_at, 1, 10) >= ? AND substr(start_at, 1, 10) <= ?
-                ORDER BY start_at
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
-    def query_workouts(
+    def aggregate(
         self,
+        data_type: str,
         user_id: str,
         start_date: str,
         end_date: str,
+        column: str,
+        where: dict[str, Any] | None = None,
+        group: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Query workout records."""
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM workouts
-                WHERE user_id = ?
-                AND substr(start_at, 1, 10) >= ? AND substr(start_at, 1, 10) <= ?
-                ORDER BY start_at
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
+        """数值列的 count/sum/min/avg/max，在 SQL 里完成，避免把逐分钟样本读进内存。
 
-    def query_body_measurements(
+        group 取 None（整段一行）、"day" 或 "hour"。
+        """
+        table = TABLES[data_type]
+        if column not in table.field_names:
+            raise ValueError(f"{data_type} 没有字段 {column!r}")
+        if group not in (None, "day", "hour"):
+            raise ValueError("group 必须是 None、'day' 或 'hour'")
+        where_sql, params = self._range_filter(table, user_id, start_date, end_date, where)
+        stats = (
+            f"COUNT({column}) AS count, SUM({column}) AS sum, MIN({column}) AS min, "
+            f"ROUND(AVG({column}), 1) AS avg, MAX({column}) AS max"
+        )
+        if group is None:
+            sql = f"SELECT {stats} FROM {table.name} WHERE {where_sql}"
+        else:
+            span = 10 if group == "day" else 13
+            sql = (
+                f"SELECT substr({table.time_col}, 1, {span}) AS bucket, {stats} "
+                f"FROM {table.name} WHERE {where_sql} GROUP BY bucket ORDER BY bucket"
+            )
+        with self._get_connection() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def bucket_counts(
         self,
+        data_type: str,
         user_id: str,
         start_date: str,
         end_date: str,
-    ) -> list[dict[str, Any]]:
-        """Query body measurement records."""
+        column: str,
+        edges: tuple[tuple[str, float, float], ...],
+        where: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """按 [low, high) 区间统计某数值列的样本数，一次扫描完成（edges 为 (名称, 下界, 上界)）。"""
+        table = TABLES[data_type]
+        if column not in table.field_names:
+            raise ValueError(f"{data_type} 没有字段 {column!r}")
+        where_sql, params = self._range_filter(table, user_id, start_date, end_date, where)
+        cases = ", ".join(
+            f"SUM(CASE WHEN {column} >= ? AND {column} < ? THEN 1 ELSE 0 END)" for _ in edges
+        )
+        bounds = [bound for _, low, high in edges for bound in (low, high)]
         with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM body_measurements
-                WHERE user_id = ?
-                AND substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
-                ORDER BY timestamp
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
+            row = conn.execute(
+                f"SELECT {cases} FROM {table.name} WHERE {where_sql}",
+                [*bounds, *params],
+            ).fetchone()
+        return {name: int(row[i] or 0) for i, (name, _, _) in enumerate(edges)}
 
-    def query_heart_rate_samples(
-        self,
-        user_id: str,
-        start_date: str,
-        end_date: str,
-    ) -> list[dict[str, Any]]:
+    def count(self, data_type: str, user_id: str, start_date: str, end_date: str) -> int:
+        table = TABLES[data_type]
+        validate_date(start_date, "start_date")
+        validate_date(end_date, "end_date")
         with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM heart_rate_samples
-                WHERE user_id = ?
-                AND substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
-                ORDER BY timestamp
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
-
-    def query_spo2_samples(
-        self,
-        user_id: str,
-        start_date: str,
-        end_date: str,
-    ) -> list[dict[str, Any]]:
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM spo2_samples
-                WHERE user_id = ?
-                AND substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
-                ORDER BY timestamp
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
-
-    def query_stress_samples(
-        self,
-        user_id: str,
-        start_date: str,
-        end_date: str,
-    ) -> list[dict[str, Any]]:
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM stress_samples
-                WHERE user_id = ?
-                AND substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ?
-                ORDER BY timestamp
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
-
-    def query_abnormal_heart_beat_events(
-        self,
-        user_id: str,
-        start_date: str,
-        end_date: str,
-    ) -> list[dict[str, Any]]:
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM abnormal_heart_beat_events
-                WHERE user_id = ?
-                AND substr(start_at, 1, 10) >= ? AND substr(start_at, 1, 10) <= ?
-                ORDER BY start_at
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return conn.execute(
+                f"SELECT COUNT(*) FROM {table.name} "
+                f"WHERE user_id = ? AND {table.time_col} >= ? AND {table.time_col} < ?",
+                (user_id, start_date, _next_day(end_date)),
+            ).fetchone()[0]
 
     def get_data_coverage(self, user_id: str) -> list[dict[str, Any]]:
-        """Get data coverage statistics."""
+        """每类数据的首/末日期、有数据的天数与记录条数。"""
+        results = []
         with self._get_connection() as conn:
-            results = []
-
-            # 日常活动覆盖范围
-            row = conn.execute(
-                """
-                SELECT
-                    MIN(date) as first_date,
-                    MAX(date) as last_date,
-                    COUNT(DISTINCT date) as days_with_data
-                FROM daily_activity
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-            if row and row["first_date"]:
-                results.append(
-                    {
-                        "data_type": "daily_activity",
-                        **dict(row),
-                    }
-                )
-
-            # 睡眠覆盖范围
-            row = conn.execute(
-                """
-                SELECT
-                    MIN(substr(start_at, 1, 10)) as first_date,
-                    MAX(substr(start_at, 1, 10)) as last_date,
-                    COUNT(DISTINCT substr(start_at, 1, 10)) as days_with_data
-                FROM sleep_sessions
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-            if row and row["first_date"]:
-                results.append(
-                    {
-                        "data_type": "sleep",
-                        **dict(row),
-                    }
-                )
-
-            # 运动记录覆盖范围
-            row = conn.execute(
-                """
-                SELECT
-                    MIN(substr(start_at, 1, 10)) as first_date,
-                    MAX(substr(start_at, 1, 10)) as last_date,
-                    COUNT(DISTINCT substr(start_at, 1, 10)) as days_with_data
-                FROM workouts
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-            if row and row["first_date"]:
-                results.append(
-                    {
-                        "data_type": "workouts",
-                        **dict(row),
-                    }
-                )
-
-            # 身体测量覆盖范围
-            row = conn.execute(
-                """
-                SELECT
-                    MIN(substr(timestamp, 1, 10)) as first_date,
-                    MAX(substr(timestamp, 1, 10)) as last_date,
-                    COUNT(DISTINCT substr(timestamp, 1, 10)) as days_with_data
-                FROM body_measurements
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-            if row and row["first_date"]:
-                results.append(
-                    {
-                        "data_type": "body_measurements",
-                        **dict(row),
-                    }
-                )
-
-            row = conn.execute(
-                """
-                SELECT
-                    MIN(substr(timestamp, 1, 10)) as first_date,
-                    MAX(substr(timestamp, 1, 10)) as last_date,
-                    COUNT(DISTINCT substr(timestamp, 1, 10)) as days_with_data
-                FROM heart_rate_samples
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-            if row and row["first_date"]:
-                results.append(
-                    {
-                        "data_type": "heart_rate",
-                        **dict(row),
-                    }
-                )
-
-            for data_type, table_name, date_expr in [
-                ("spo2", "spo2_samples", "timestamp"),
-                ("stress", "stress_samples", "timestamp"),
-                ("abnormal_heart_beat", "abnormal_heart_beat_events", "start_at"),
-            ]:
+            for data_type, table in TABLES.items():
+                expr = f"substr({table.time_col}, 1, 10)"
                 row = conn.execute(
                     f"""
-                    SELECT
-                        MIN(date({date_expr})) as first_date,
-                        MAX(date({date_expr})) as last_date,
-                        COUNT(DISTINCT date({date_expr})) as days_with_data
-                    FROM {table_name}
-                    WHERE user_id = ?
+                    SELECT MIN({expr}) AS first_date, MAX({expr}) AS last_date,
+                           COUNT(DISTINCT {expr}) AS days_with_data, COUNT(*) AS record_count
+                    FROM {table.name} WHERE user_id = ?
                     """,
                     (user_id,),
                 ).fetchone()
-                if row and row["first_date"]:
+                if row["first_date"]:
                     results.append({"data_type": data_type, **dict(row)})
+        return results
 
-            return results
+    def distinct_dates(
+        self, data_type: str, user_id: str, start_date: str, end_date: str
+    ) -> list[str]:
+        table = TABLES[data_type]
+        validate_date(start_date, "start_date")
+        validate_date(end_date, "end_date")
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT substr({table.time_col}, 1, 10) AS d FROM {table.name} "
+                f"WHERE user_id = ? AND {table.time_col} >= ? AND {table.time_col} < ? ORDER BY d",
+                (user_id, start_date, _next_day(end_date)),
+            ).fetchall()
+        return [r["d"] for r in rows]
+
+    def top(
+        self,
+        data_type: str,
+        user_id: str,
+        column: str,
+        *,
+        descending: bool = True,
+        where: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """某数值列（忽略 NULL 与 0）的极值所在整行，用于个人纪录。"""
+        table = TABLES[data_type]
+        if column not in table.field_names:
+            raise ValueError(f"{data_type} 没有字段 {column!r}")
+        clauses = ["user_id = ?", f"{column} > 0"]
+        params: list[Any] = [user_id]
+        for key, value in (where or {}).items():
+            if key not in table.field_names:
+                raise ValueError(f"{data_type} 没有可过滤的字段 {key!r}")
+            clauses.append(f"{key} = ?")
+            params.append(value)
+        order = "DESC" if descending else "ASC"
+        with self._get_connection() as conn:
+            row = conn.execute(
+                f"SELECT * FROM {table.name} WHERE {' AND '.join(clauses)} "
+                f"ORDER BY {column} {order} LIMIT 1",
+                params,
+            ).fetchone()
+        return dict(row) if row else None
+
+    def table_stats(self) -> dict[str, dict[str, Any]]:
+        """每张表的总行数与账号数（status 命令用，不区分账号）。"""
+        stats = {}
+        with self._get_connection() as conn:
+            for data_type, table in TABLES.items():
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS users FROM {table.name}"
+                ).fetchone()
+                stats[data_type] = {"records": row["n"], "users": row["users"]}
+        return stats
+
+    # --------------------------------------------------------------- API keys
+
+    def api_key_row(self, key: str) -> sqlite3.Row | None:
+        with self._get_connection() as conn:
+            return conn.execute("SELECT * FROM api_keys WHERE key = ?", (key,)).fetchone()
+
+
+__all__ = ["COMMON_COLUMNS", "TABLES", "Database", "validate_date"]

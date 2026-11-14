@@ -5,6 +5,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+DATA_TYPES: tuple[str, ...] = (
+    "daily_activity",
+    "heart_rate",
+    "body_measurements",
+    "sleep",
+    "workouts",
+    "spo2",
+    "stress",
+    "abnormal_heart_beat",
+)
+
 
 class BaseEntity(BaseModel):
     """Base entity with common fields."""
@@ -120,44 +131,10 @@ class AbnormalHeartBeatEvent(BaseEntity):
     duration_seconds: int = Field(ge=0, description="Event duration in seconds")
 
 
-class UserProfile(BaseModel):
-    """User profile information."""
-
-    user_id: str = Field(description="User identifier")
-    display_name: str | None = Field(None, description="Display name")
-    birth_year: int | None = Field(None, description="Birth year")
-    sex: Literal["male", "female", "other"] | None = Field(None, description="Sex")
-    height_cm: float | None = Field(None, gt=0, description="Height in cm")
-    timezone: str = Field(default="UTC", description="User timezone")
-    devices: list[dict[str, Any]] = Field(default_factory=list, description="Connected devices")
-
-
-class DeviceInfo(BaseModel):
-    """Connected device information."""
-
-    device_id: str = Field(description="Device identifier")
-    device_type: str = Field(description="Type (band, watch, scale)")
-    model: str = Field(description="Device model")
-    firmware_version: str | None = Field(None, description="Firmware version")
-    last_sync_at: datetime | None = Field(None, description="Last sync time")
-
-
-class DataCoverage(BaseModel):
-    """Data coverage information for a metric."""
-
-    data_type: str = Field(description="Type of data")
-    first_date: str | None = Field(None, description="First date with data")
-    last_date: str | None = Field(None, description="Last date with data")
-    days_with_data: int = Field(ge=0, description="Number of days with data")
-    gaps_detected: list[tuple[str, str]] = Field(
-        default_factory=list, description="Detected date gaps"
-    )
-
-
 class ConnectionStatus(BaseModel):
     """Connection status response."""
 
-    mode: Literal["mi_fitness_cloud", "not_configured"]
+    mode: Literal["mi_fitness_cloud", "not_configured", "demo"]
     connected: bool
     last_sync_at: datetime | None = None
     available_data_types: list[str] = Field(default_factory=list)
@@ -165,18 +142,6 @@ class ConnectionStatus(BaseModel):
     sync_health: Literal["healthy", "stale", "error", "unknown"] = "unknown"
     next_action: str | None = None
     message: str | None = None
-
-
-class SyncResult(BaseModel):
-    """Data synchronization result."""
-
-    sync_id: str = Field(description="Unique sync identifier")
-    started_at: datetime = Field(description="Sync start time")
-    finished_at: datetime = Field(description="Sync end time")
-    records_added: int = Field(ge=0, description="New records added")
-    records_updated: int = Field(ge=0, description="Records updated")
-    records_skipped: int = Field(ge=0, description="Records skipped (duplicates)")
-    data_types_synced: list[str] = Field(default_factory=list)
 
 
 class QueryResponse(BaseModel):

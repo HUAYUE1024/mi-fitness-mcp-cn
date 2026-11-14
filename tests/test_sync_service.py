@@ -7,17 +7,23 @@ class FakeAdapter:
     def is_connected(self):
         return True
 
+    def get_user_id(self):
+        return "u1"
+
     async def iter_daily_activity(self, start_date, end_date):
         if False:
             yield None
 
 
 class FakeDatabase:
-    def get_sync_state(self, data_type):
+    def get_sync_state(self, user_id, data_type):
         return None
 
-    def update_sync_state(self, data_type, timestamp):
+    def update_sync_state(self, user_id, data_type, timestamp):
         raise AssertionError("empty sync must not advance cursor")
+
+    def upsert(self, data_type, records):
+        return {"added": 0, "updated": 0, "skipped": 0}
 
 
 @pytest.mark.asyncio

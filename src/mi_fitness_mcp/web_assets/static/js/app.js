@@ -19,6 +19,7 @@ const state = {
 
 // DOM Utilities
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const $$ = (selector) => document.querySelectorAll(selector);
 
 // Date Helpers
@@ -195,7 +196,7 @@ async function api(method, path, body = null) {
       showToast(`请求失败: HTTP ${resp.status}`, jsonObj?.error || jsonObj?.detail || '请查看控制台输出', 'error');
     }
 
-    return jsonObj;
+    return jsonObj && jsonObj.data !== undefined ? jsonObj.data : jsonObj;
   } catch (err) {
     const latency = Math.round(performance.now() - startTime);
     updateInspectorHeader(method, path, 'err', '网络错误', latency);
@@ -311,44 +312,17 @@ function downloadJson() {
 
 // Overview Dashboard Loader
 async function loadOverview() {
-  showToast('正在加载仪表盘概览…', '', 'info', 1500);
-  const summaryPromise = api('GET', getRangeQuery('/api/summary'));
-  const hrPromise = api('GET', getRangeQuery('/api/heart-rate') + '&sample_type=resting&limit=1');
-  const sleepPromise = api('GET', getRangeQuery('/api/sleep') + '&include_naps=true');
-  const spo2Promise = api('GET', getRangeQuery('/api/spo2') + '&limit=1');
-  const stressPromise = api('GET', getRangeQuery('/api/stress') + '&limit=1');
-
-  const [summary, hr, sleep, spo2, stress] = await Promise.all([
-    summaryPromise, hrPromise, sleepPromise, spo2Promise, stressPromise
-  ]);
-
-  if (summary && Array.isArray(summary) && summary.length > 0) {
-    const latest = summary[summary.length - 1];
-    $('statSteps').textContent = latest.steps ? latest.steps.toLocaleString() : '0';
-    $('statCalories').textContent = latest.active_calories ? Math.round(latest.active_calories) : '0';
-    $('statDistance').textContent = latest.distance ? (latest.distance / 1000).toFixed(2) : '0';
-  }
-
-  if (hr && Array.isArray(hr) && hr.length > 0) {
-    $('statHr').textContent = hr[0].bpm || '--';
-  }
-
-  if (sleep && Array.isArray(sleep) && sleep.length > 0) {
-    const lastSleep = sleep[sleep.length - 1];
-    const totalMinutes = lastSleep.duration_minutes || (lastSleep.end_time - lastSleep.start_time) / 60;
-    const hours = (totalMinutes / 60).toFixed(1);
-    $('statSleep').textContent = isNaN(hours) ? '--' : hours;
-  }
-
-  if (spo2 && Array.isArray(spo2) && spo2.length > 0) {
-    $('statSpo2').textContent = spo2[0].spo2_value ? `${spo2[0].spo2_value}%` : '--';
-  }
-
-  if (stress && Array.isArray(stress) && stress.length > 0) {
-    $('statStress').textContent = stress[0].stress_value || '--';
-  }
-
-  showToast('仪表盘已刷新', '最新数据已加载', 'success');
+  const d = await api('GET', '/api/overview?date=' + encodeURIComponent(getEd()));
+  if (!d || !d.date) return;
+  const t = d.today || {};
+  const show = (id, value, fmt = (v) => v) => { $(id).textContent = value == null ? '--' : fmt(value); };
+  show('statSteps', t.steps, (v) => v.toLocaleString());
+  show('statCalories', t.active_kcal, (v) => Math.round(v));
+  show('statDistance', t.distance_m, (v) => (v / 1000).toFixed(2));
+  show('statHr', d.resting_heart_rate);
+  show('statSleep', d.sleep_last_night && d.sleep_last_night.time_asleep_minutes, (v) => (v / 60).toFixed(1));
+  show('statSpo2', d.latest_spo2, (v) => v + '%');
+  show('statStress', d.latest_stress);
 }
 
 // Health Data Queries
@@ -380,12 +354,12 @@ function renderSummaryVisual(data) {
   `;
 
   data.forEach(item => {
-    const distKm = item.distance ? (item.distance / 1000).toFixed(2) : '0.00';
+    const distKm = item.distance_m ? (item.distance_m / 1000).toFixed(2) : '0.00';
     html += `
       <tr>
         <td><strong>${item.date || '--'}</strong></td>
         <td><span class="badge badge-success">👟 ${(item.steps || 0).toLocaleString()} 步</span></td>
-        <td>🔥 ${Math.round(item.active_calories || 0)} kcal</td>
+        <td>🔥 ${Math.round(item.active_kcal || 0)} kcal</td>
         <td>📍 ${distKm} km</td>
       </tr>
     `;
@@ -415,10 +389,11 @@ function renderSleepTimeline(data) {
   }
 
   const latest = data[data.length - 1];
-  const deep = latest.deep_sleep_minutes || 0;
-  const light = latest.light_sleep_minutes || 0;
-  const rem = latest.rem_sleep_minutes || 0;
-  const awake = latest.awake_minutes || 0;
+  const minutesOf = (name) => (latest.stages || []).filter((s) => s.stage === name).reduce((a, s) => a + s.minutes, 0);
+  const deep = minutesOf('deep');
+  const light = minutesOf('light');
+  const rem = minutesOf('rem');
+  const awake = minutesOf('awake');
   const total = deep + light + rem + awake || 1;
 
   container.innerHTML = `
@@ -465,7 +440,7 @@ async function queryMetricSeries() {
   const metric = $('metricSelect').value;
   const gran = $('granularitySelect').value;
   const agg = $('aggregationSelect').value;
-  const q = `${getRangeQuery('/api/metric-series')}&metric=${metric}&granularity=${gran}&aggregation=${agg}`;
+  const q = `${getRangeQuery('/api/metric-series')}&metric=${metric}&granularity=${gran}` + (agg ? `&aggregation=${agg}` : '');
   const data = await api('GET', q);
   renderMetricChart(data, metric);
 }
@@ -497,6 +472,66 @@ function renderMetricChart(data, metricName) {
   });
 
   container.innerHTML = barsHtml;
+}
+
+// Insights (report / records / gaps)
+const REPORT_ROWS = [
+  ['total_steps', '总步数', ''], ['avg_daily_steps', '日均步数', ''], ['total_distance_km', '总距离', ' km'],
+  ['total_active_kcal', '活动消耗', ' kcal'], ['avg_sleep_minutes', '平均睡眠', ' 分钟'], ['avg_heart_rate', '平均心率', ' bpm'],
+  ['avg_resting_heart_rate', '平均静息心率', ' bpm'], ['avg_spo2', '平均血氧', '%'], ['avg_stress', '平均压力', ''],
+  ['workout_count', '运动次数', ' 次'], ['workout_minutes', '运动时长', ' 分钟'], ['weight_kg_change', '体重变化', ' kg'],
+];
+const fmtNum = (v, unit = '') => (v == null ? '—' : (typeof v === 'number' ? v.toLocaleString() : esc(v)) + unit);
+const FAILED = '<p class="panel-subtitle">请求失败或无数据，详情见右侧响应检视</p>';
+
+function setInsights(html) { $('insightsWrapper').innerHTML = html; }
+
+async function loadReport() {
+  const r = await api('GET', getRangeQuery('/api/report'));
+  if (!r || !r.metrics) return setInsights(FAILED);
+  const body = REPORT_ROWS.map(([key, label, unit]) => {
+    const change = r.change_pct[key];
+    const badge = change == null ? '' : `<span class="badge ${change >= 0 ? 'badge-success' : ''}">${change >= 0 ? '▲' : '▼'} ${Math.abs(change)}%</span>`;
+    return `<tr><td>${label}</td><td><strong>${fmtNum(r.metrics[key], unit)}</strong></td><td>${fmtNum(r.previous_metrics[key], unit)}</td><td>${badge}</td></tr>`;
+  }).join('');
+  const s = r.sleep || {};
+  const sleep = s.nights
+    ? `<p class="panel-subtitle" style="margin-top:12px">😴 平均 ${esc(s.avg_bedtime)} 入睡 / ${esc(s.avg_wake_time)} 起床，入睡时间波动 ±${s.bedtime_variability_minutes} 分钟，${s.short_nights_under_6h} 晚睡不足 6 小时</p>` : '';
+  setInsights(`<div class="data-table-container"><table class="data-table">
+    <thead><tr><th>指标</th><th>本期 ${esc(r.period.start_date)} ~ ${esc(r.period.end_date)}</th><th>上期 ${esc(r.previous_period.start_date)} ~ ${esc(r.previous_period.end_date)}</th><th>变化</th></tr></thead>
+    <tbody>${body}</tbody></table></div>${sleep}`);
+}
+
+async function loadRecords() {
+  const r = await api('GET', '/api/records');
+  if (!r || r.step_goal == null) return setInsights(FAILED);
+  const day = (iso) => esc((iso || '').slice(0, 10));
+  const w = (row, text) => (row ? text(row) : null);
+  const items = [
+    ['👣 单日最多步数', w(r.most_steps_day, (x) => `${x.steps.toLocaleString()} 步（${day(x.date)}）`)],
+    ['⏱️ 最长运动', w(r.longest_workout, (x) => `${x.duration_minutes} 分钟 ${esc(x.activity_type)}（${day(x.start_at)}）`)],
+    ['🛣️ 最远运动', w(r.farthest_workout, (x) => `${(x.distance_m / 1000).toFixed(2)} km ${esc(x.activity_type)}（${day(x.start_at)}）`)],
+    ['🔥 最耗能运动', w(r.most_calories_workout, (x) => `${Math.round(x.calories_kcal)} kcal ${esc(x.activity_type)}（${day(x.start_at)}）`)],
+    ['🌙 最佳睡眠评分', w(r.best_sleep_score, (x) => `${x.sleep_score} 分（${day(x.start_at)}）`)],
+    ['❤️ 最低静息心率', w(r.lowest_resting_heart_rate, (x) => `${x.bpm} bpm（${day(x.timestamp)}）`)],
+    ['⚖️ 最低体重', w(r.lowest_weight, (x) => `${x.weight_kg} kg（${day(x.timestamp)}）`)],
+    [`🎯 步数目标 ${r.step_goal.toLocaleString()} 连续达成`, `最长 ${r.longest_goal_streak_days} 天，当前 ${r.current_goal_streak_days} 天`],
+  ];
+  const rows = items.map(([label, value]) => `<tr><td>${label}</td><td><strong>${value || '—'}</strong></td></tr>`).join('');
+  setInsights(`<div class="data-table-container"><table class="data-table"><tbody>${rows}</tbody></table></div>`);
+}
+
+async function loadGaps() {
+  const items = await api('GET', getRangeQuery('/api/gaps'));
+  if (!Array.isArray(items)) return setInsights(FAILED);
+  const body = items.map((i) => {
+    const gaps = i.gaps.slice(0, 6).map((g) => (g.days === 1 ? g.start_date : `${g.start_date} ~ ${g.end_date}`)).join('、');
+    const more = i.gaps.length > 6 ? ` … 另 ${i.gaps.length - 6} 段` : '';
+    const cell = i.missing_days ? `缺 ${i.missing_days} 天：${esc(gaps)}${more}` : '✅ 完整';
+    return `<tr><td><strong>${esc(i.data_type)}</strong></td><td>${i.days_with_data}/${i.days_in_range}</td><td>${cell}</td></tr>`;
+  }).join('');
+  setInsights(`<div class="data-table-container"><table class="data-table"><thead><tr><th>数据类型</th><th>有数据天数</th><th>缺口</th></tr></thead><tbody>${body}</tbody></table></div>
+    <p class="panel-subtitle" style="margin-top:12px">缺口 ≠ 数值为 0：多半是没戴手环、没开该项监测或没同步，先确认再下结论。</p>`);
 }
 
 // Sync Center Control
@@ -715,42 +750,27 @@ async function listKeys() {
 function renderKeysTable(data) {
   const container = $('keysTableWrapper');
   if (!container) return;
-  if (!data || !Array.isArray(data) || data.length === 0) {
+  if (!Array.isArray(data) || data.length === 0) {
     container.innerHTML = '<p class="panel-subtitle">暂无已发放的 API Key 记录</p>';
     return;
   }
-
-  let html = `
-    <div class="data-table-container">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>标签</th>
-            <th>Key 前缀</th>
-            <th>User ID</th>
-            <th>创建时间</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-  `;
-
-  data.forEach(k => {
-    html += `
-      <tr>
-        <td><strong>${k.label || '默认'}</strong></td>
-        <td><code>${k.prefix || k.api_key_prefix || 'mif_sk_...'}</code></td>
-        <td>${k.user_id || '--'}</td>
-        <td>${k.created_at || '--'}</td>
-        <td>
-          <button class="btn btn-danger btn-sm" onclick="revokeKeyByPrefix('${k.prefix || k.api_key_prefix}')">吊销</button>
-        </td>
-      </tr>
-    `;
-  });
-
-  html += '</tbody></table></div>';
-  container.innerHTML = html;
+  const when = (v, fallback) => esc((v || fallback).slice(0, 19).replace('T', ' '));
+  const rows = data.map((k) => `
+    <tr>
+      <td><strong>${esc(k.label || '默认')}</strong></td>
+      <td><code>${esc(k.key_masked)}</code></td>
+      <td>${esc(k.user_id)}</td>
+      <td>${when(k.created_at, '--')}</td>
+      <td>${when(k.last_used_at, '从未')}</td>
+      <td>${k.revoked
+        ? '<span class="badge">已吊销</span>'
+        : `<button class="btn btn-danger btn-sm" data-prefix="${esc(k.prefix)}" onclick="revokeKeyByPrefix(this.dataset.prefix)">吊销</button>`}</td>
+    </tr>`).join('');
+  container.innerHTML = `
+    <div class="data-table-container"><table class="data-table">
+      <thead><tr><th>标签</th><th>Key</th><th>User ID</th><th>创建时间</th><th>最近使用</th><th>操作</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
 }
 
 async function revokeKeyByPrefix(prefix) {

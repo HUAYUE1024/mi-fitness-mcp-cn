@@ -24,7 +24,6 @@ from flask import (
 
 from mi_fitness_mcp.security import default_allowed_hosts, host_allowed
 
-# Assets directory: src/mi_fitness_mcp/web_assets or fallback to testpage
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_ASSETS_DIR = PACKAGE_DIR / "web_assets"
 
