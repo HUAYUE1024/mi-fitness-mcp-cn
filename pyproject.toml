@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mi-fitness-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "MCP server for Mi Fitness data access"
 readme = "README.md"
 license = {text = "MIT"}
@@ -58,6 +58,11 @@ mi-fitness-mcp = "mi_fitness_mcp.cli_mi_fitness:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mi_fitness_mcp"]
+artifacts = [
+  "src/mi_fitness_mcp/web_assets/**/*.css",
+  "src/mi_fitness_mcp/web_assets/**/*.js",
+  "src/mi_fitness_mcp/web_assets/**/*.html",
+]
 
 [tool.ruff]
 target-version = "py311"

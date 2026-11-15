@@ -1,0 +1,76 @@
+/* Design tokens: one neutral ramp, one accent, six data hues. */
+:root {
+  --font-sans: "Inter", "SF Pro Text", ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text",
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans CJK SC", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+
+  --r-xs: 4px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  --rail-w: 248px;
+  --topbar-h: 64px;
+  --gap: 20px;
+  --pad: 24px;
+  --page-x: 36px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #090b0e;
+  --rail: #0c0f12;
+  --surface: #11151a;
+  --surface-2: #161b21;
+  --surface-3: #1d232b;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-2: rgba(255, 255, 255, 0.14);
+  --text: #eceff4;
+  --text-2: #a6aebb;
+  --text-3: #7d8696;
+  --accent: #ff6b3d;
+  --accent-ink: #1b0b04;
+  --accent-soft: rgba(255, 107, 61, 0.13);
+  --c-steps: #ff6b3d;
+  --c-workout: #ffa25e;
+  --c-heart: #f2557a;
+  --c-sleep: #9a8cff;
+  --c-oxygen: #3cc6da;
+  --c-stress: #e8b94a;
+  --c-body: #5ed39b;
+  --good: #5ed39b;
+  --warn: #e8b94a;
+  --bad: #f2557a;
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 18px 40px -22px rgba(0, 0, 0, 0.7);
+  --glow: radial-gradient(900px 520px at 6% -12%, rgba(255, 107, 61, 0.075), transparent 62%);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f2ee;
+  --rail: #eeebe5;
+  --surface: #ffffff;
+  --surface-2: #f8f6f2;
+  --surface-3: #eeebe5;
+  --line: rgba(20, 18, 14, 0.09);
+  --line-2: rgba(20, 18, 14, 0.18);
+  --text: #16130f;
+  --text-2: #55504a;
+  --text-3: #6f695f;
+  --accent: #d6431a;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(214, 67, 26, 0.1);
+  --c-steps: #d6431a;
+  --c-workout: #c47320;
+  --c-heart: #cc3158;
+  --c-sleep: #6450e0;
+  --c-oxygen: #0f8aa0;
+  --c-stress: #a67c0c;
+  --c-body: #1a8f5f;
+  --good: #1a8f5f;
+  --warn: #a67c0c;
+  --bad: #cc3158;
+  --shadow: 0 1px 2px rgba(20, 18, 14, 0.05), 0 14px 30px -20px rgba(20, 18, 14, 0.25);
+  --glow: radial-gradient(900px 520px at 6% -12%, rgba(214, 67, 26, 0.06), transparent 62%);
+}

@@ -74,7 +74,7 @@ def generate_demo_data(
         awake = rng.randint(12, 38)
         wake = bed + timedelta(minutes=asleep + awake)
         deep, rem = int(asleep * rng.uniform(0.15, 0.22)), int(asleep * rng.uniform(0.18, 0.25))
-        if worn:
+        if worn and wake <= datetime.now(TZ):
             batches["sleep"].append(
                 SleepSession(
                     id=f"demo_sleep_{key}", timezone=TZ_NAME, collected_at=wake, sleep_id=f"demo_{key}",

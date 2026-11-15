@@ -63,6 +63,23 @@ def create_app(
             return jsonify({"detail": "Host not allowed"}), 403
         return None
 
+    @app.after_request
+    def _security_headers(resp):
+        # 仪表盘会代理健康数据与 API Key：只允许同源脚本，禁止被嵌入其它页面，不外泄 Referer。
+        # style-src 需要 'unsafe-inline'：图表的柱高/颜色以 style 属性内联；脚本仍严格同源。
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        )
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        if request.path == "/" or request.path.startswith("/proxy"):
+            resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     @app.route("/")
     def index():
         """Render the main dashboard interface."""

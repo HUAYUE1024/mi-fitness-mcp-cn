@@ -51,7 +51,7 @@ class Table:
 
     def index_ddl(self) -> str:
         return (
-            f"CREATE INDEX IF NOT EXISTS idx_{self.name}_user_time "
+            f"CREATE INDEX IF NOT EXISTS idx_{self.name}_user_{self.time_col} "
             f"ON {self.name}(user_id, {self.time_col})"
         )
 
@@ -89,7 +89,7 @@ _TABLES = (
         "duration_minutes INTEGER NOT NULL, time_asleep_minutes INTEGER NOT NULL, "
         "time_awake_minutes INTEGER NOT NULL, sleep_score INTEGER, "
         "is_nap BOOLEAN DEFAULT FALSE, stages TEXT",
-        "start_at",
+        "end_at",  # 睡眠归属起床当天：0:08 入睡和 23:21 入睡的两晚不会挤进同一天、也不会漏掉另一天
         "start_at",
     ),
     _table(

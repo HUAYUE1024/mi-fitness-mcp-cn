@@ -108,8 +108,8 @@ def test_find_data_gaps_merges_consecutive_days(tmp_path):
     generate_demo_data(db, days=10, seed=3, end=END)
     svc = AnalyticsService(db, DEMO_USER_ID)
     (report,) = svc.find_data_gaps("2025-06-01", "2025-06-30", ["sleep"])
-    # 只生成了最近 10 天，6/1~6/20 整段应合并成一个缺口区间
-    assert report["gaps"][0] == {"start_date": "2025-06-01", "end_date": "2025-06-20", "days": 20}
+    # 睡眠归属起床当天：最近 10 晚是 6/21~6/30 入睡，6/22~7/1 醒来，所以 6/1~6/21 是一个缺口区间
+    assert report["gaps"][0] == {"start_date": "2025-06-01", "end_date": "2025-06-21", "days": 21}
     with pytest.raises(ValueError):
         svc.find_data_gaps("2025-06-01", "2025-06-30", ["bogus"])
 
@@ -134,3 +134,26 @@ def test_multi_device_steps_are_not_double_counted(tmp_path):
 def test_demo_generation_never_violates_model_constraints(tmp_path, seed):
     """回归：随机值（如活动卡路里）曾在步数很少的日子里算出负数，导致 API 启动即崩溃。"""
     generate_demo_data(Database(tmp_path / f"{seed}.db"), days=120, seed=seed, end=END)
+
+
+def test_sleep_is_filed_under_the_day_you_wake_up(tmp_path):
+    """回归：按入睡日归属时，0:08 入睡与 23:21 入睡的两晚落在同一天，被加成 16 小时。"""
+    from datetime import datetime, timedelta, timezone
+
+    from mi_fitness_mcp.models import SleepSession
+
+    tz = timezone(timedelta(hours=8))
+    base = {"provider": "mi_fitness", "source_type": "cloud_session", "user_id": "u"}
+
+    def night(sid, bed, wake):
+        asleep = int((wake - bed).total_seconds() // 60)
+        return SleepSession(id=sid, sleep_id=sid, start_at=bed, end_at=wake, duration_minutes=asleep,
+                            time_asleep_minutes=asleep, time_awake_minutes=0, **base)
+
+    db = Database(tmp_path / "s.db")
+    db.upsert("sleep", [
+        night("a", datetime(2026, 11, 2, 0, 8, tzinfo=tz), datetime(2026, 11, 2, 9, 12, tzinfo=tz)),
+        night("b", datetime(2026, 11, 2, 23, 21, tzinfo=tz), datetime(2026, 11, 3, 7, 14, tzinfo=tz)),
+    ])
+    series = AnalyticsService(db, "u").get_metric_series("sleep_minutes", "2026-11-02", "2026-11-03")
+    assert [(p["date"], p["value"]) for p in series] == [("2026-11-02", 544), ("2026-11-03", 473)]

@@ -3,14 +3,19 @@
 [![CI](https://github.com/HUAYUE1024/mi-fitness-mcp-cn/actions/workflows/ci.yml/badge.svg)](https://github.com/HUAYUE1024/mi-fitness-mcp-cn/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-orange.svg)](CHANGELOG.md)
 
 **让 AI 读懂你的小米手环数据。** 把小米运动健康（Mi Fitness）里你自己的数据同步到本机 SQLite，再通过 **MCP / REST API / 命令行 / Web 仪表盘** 随时查询、分析、导出。数据不出本机。
 
 > Local-first Mi Fitness (Xiaomi Band / Watch) data hub. Sync your own health data to SQLite, then ask Claude about it over MCP, or use the CLI, REST API and web dashboard.
 
 <p align="center">
-  <img src="docs/images/dashboard-overview.jpg" alt="Web 仪表盘（演示数据）" width="760">
+  <img src="docs/images/dashboard-overview.jpg" alt="Web 仪表盘总览（演示数据）" width="760">
+</p>
+
+<p align="center">
+  <img src="docs/images/dashboard-sleep.jpg" alt="睡眠分析" width="380">
+  <img src="docs/images/dashboard-insights.jpg" alt="健康洞察" width="380">
 </p>
 
 ## 10 秒体验（不需要小米账号）
@@ -30,15 +35,15 @@ mi-fitness-mcp report --demo         # 周报，并与上一周对比
 ```
 
 ```text
-📅 2026-11-14 健康快照（演示数据）
+📅 2026-11-15 健康快照（演示数据）
 ==================================================
-👣 步数      3,893   距离 2.65 km   活动消耗 172 kcal
-😴 昨晚睡眠  7h26m   评分 98
-❤️  心率      静息 56 bpm   最近 62 bpm
-🫁 血氧 96%   🧠 压力 5
-⚖️  体重      72.51 kg   BMI 23.4   体脂 20.4%
+👣 步数      7,100   距离 4.83 km   活动消耗 293 kcal
+😴 昨晚睡眠  7h39m   评分 96
+❤️  心率      静息 56 bpm   最近 58 bpm
+🫁 血氧 96%   🧠 压力 24
+⚖️  体重      73.32 kg   BMI 23.7   体脂 20.9%
 
-近 7 天：日均 7,303 步，最佳 9,313 步，7 天有数据，运动 3 次
+近 7 天：日均 7,407 步，最佳 11,205 步，7 天有数据，运动 5 次
 ```
 
 ## 能问 AI 什么
@@ -59,6 +64,7 @@ mi-fitness-mcp report --demo         # 周报，并与上一周对比
 | **八类数据** | 每日活动、逐分钟心率与静息心率、睡眠（深/浅/REM/清醒分期）、运动、体重与体成分、血氧、压力、异常心跳 |
 | **健康分析** | 周报/月报（自动对比上一期）、睡眠规律度、心率区间、个人纪录与连续达标、数据缺口检测 |
 | **四种入口** | MCP（20 个工具）· 命令行 · REST API · Web 仪表盘 |
+| **Web 仪表盘** | 总览 · 趋势 · 睡眠 · 洞察 · 数据 · 同步 · 接入；响应式，暗色/亮色自动跟随系统 |
 | **可靠同步** | 按 7 天分块、增量游标、批量事务写入、幂等；中途失败不会跳过未入库的数据 |
 | **多账号隔离** | 数据按账号分库存放，API Key 绑定独立账号上下文 |
 | **本地优先** | 数据与凭据只在本机（SQLite + 系统 keyring），除小米官方服务器外零第三方请求 |
@@ -75,6 +81,8 @@ python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e '.[all]'        # 全功能；只要 MCP + 命令行：pip install -e .
 ```
+
+> 不想配环境？`pip install -e . && mi-fitness-mcp dashboard --demo`，浏览器打开的是合成数据演示界面，不连小米。
 
 要求 Python ≥ 3.11。Linux 没有系统 keyring 时可 `pip install keyrings.alt`（会明文存储凭据，仅限无其它办法时）。
 
@@ -103,6 +111,7 @@ mi-fitness-mcp doctor          # 验证连通性
 mi-fitness-mcp sync --start-date 2026-01-01      # 首次：拉取历史
 mi-fitness-mcp sync                              # 之后：从上次断点增量续传
 mi-fitness-mcp sync --type sleep -v              # 只同步睡眠，逐块显示进度
+mi-fitness-mcp status                            # 看本地库里各类型有多少数据
 ```
 
 ## 接入 MCP（Claude Desktop 等）
@@ -201,6 +210,8 @@ src/mi_fitness_mcp/
 ├── server.py            # MCP 工具注册表（装饰器声明，一处定义 schema 与处理函数）
 ├── api.py               # FastAPI：数据/分析端点、Key 体系、扫码登录
 ├── web.py               # Flask 仪表盘与反向代理；前端资源在 web_assets/
+│   ├── static/js/         # 手写 ES Module：lib/ 基础库 + views/ 七个页面
+│   └── static/css/        # 设计令牌 + 布局 + 组件 + 图表样式
 ├── demo.py              # 合成演示数据，走真实存储链路
 ├── adapters/            # 小米云协议：登录、RC4、签名、分页、解析
 ├── services/
